@@ -1,11 +1,10 @@
 services:
   - type: web
     name: deepseek-telegram-bot
-    runtime: python
+    runtime: docker
     plan: free
     region: singapore
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python bot.py
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
@@ -17,7 +16,5 @@ services:
         value: small
       - key: ENABLE_HEALTH
         value: "1"
-      - key: PYTHON_VERSION
-        value: "3.11.9"
     autoDeploy: true
     healthCheckPath: /health

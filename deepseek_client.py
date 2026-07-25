@@ -110,10 +110,17 @@ class DeepSeekClient:
     # ---------- PoW ----------
     def _solve_pow(self, config: dict) -> Optional[str]:
         input_json = json.dumps(config)
-        result = subprocess.run(
-            ['node', JS_SOLVER_FILENAME, input_json],
-            capture_output=True, text=True, cwd=self.workdir, timeout=15,
-        )
+        try:
+            result = subprocess.run(
+                ['node', JS_SOLVER_FILENAME, input_json],
+                capture_output=True, text=True, cwd=self.workdir, timeout=15,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Node.js not found. The DeepSeek PoW WASM solver requires "
+                "Node.js (>=18). On Render, use runtime: docker with the "
+                "provided Dockerfile (which installs Node)."
+            )
         out = result.stdout.strip()
         return out or None
 

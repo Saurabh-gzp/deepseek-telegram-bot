@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: deepseek-telegram-bot
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: DEEPSEEK_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: WHISPER_SIZE
+        value: small
+      - key: ENABLE_HEALTH
+        value: "1"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+    autoDeploy: true
+    healthCheckPath: /health

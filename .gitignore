@@ -1,0 +1,37 @@
+# State & runtime
+state.json
+*.log
+tmp*.json
+e2e*.json
+test_state.json
+dbg*.json
+
+# WASM/JS artifacts (auto-generated on first run)
+sha3_wasm_bg.7b9ca65ddd.wasm
+pow_solver.js
+
+# Local env
+.env
+.env.local
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# User uploads
+uploads/

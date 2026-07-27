@@ -197,20 +197,6 @@ class DeepSeekClient:
         'POW': "Could not solve the security challenge (PoW). Check that Node.js is installed.",
     }
 
-    def upload_file(self, file_path: str, mime_type: str = None,
-                    wait_for_ready: bool = True, poll_timeout: float = 90.0
-                    ) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Upload file to DeepSeek. Returns (file_id, file_name).
-
-        Thin wrapper kept for backwards compatibility — see upload_file_ex()
-        which also returns the failure reason.
-        """
-        fid, fname, _reason = self.upload_file_ex(
-            file_path, mime_type=mime_type,
-            wait_for_ready=wait_for_ready, poll_timeout=poll_timeout)
-        return fid, fname
-
     def upload_file_ex(self, file_path: str, mime_type: str = None,
                        wait_for_ready: bool = True, poll_timeout: float = 90.0
                        ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -295,21 +281,9 @@ class DeepSeekClient:
 
         if status in self._TERMINAL_FAIL:
             return None, None, self._FAIL_REASON.get(
-                status, f"DeepSeek ne file reject ki (status: {status}).")
+                status, f"DeepSeek rejected the file (status: {status}).")
 
         return None, None, self._FAIL_REASON['TIMEOUT']
-
-    def get_file_status(self, file_id: str) -> Optional[dict]:
-        try:
-            r = requests.get(f"{self.BASE}/file/fetch_files",
-                             headers=self.headers,
-                             params={'file_ids': file_id}, timeout=15)
-            if r.status_code == 200:
-                files = r.json().get('data', {}).get('biz_data', {}).get('files', [])
-                if files: return files[0]
-        except Exception:
-            pass
-        return None
 
     # ---------- Chat streaming ----------
     def chat_stream(self, sess_id: str, parent_msg_id: Optional[str], prompt: str,

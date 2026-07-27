@@ -63,6 +63,10 @@ if not TELEGRAM_TOKEN or not DEEPSEEK_TOKEN or not OWNER_ID:
     )
 
 CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
+HISTORY_FILE = os.getenv("HISTORY_FILE", "history.json")
+# Max DeepSeek requests per user inside RATE_WINDOW seconds (0 disables)
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "20"))
+RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))
 
 MAX_TG_MSG = 3800
 FILE_THRESHOLD = 10000
@@ -80,6 +84,10 @@ ds = DeepSeekClient(DEEPSEEK_TOKEN, workdir=WORKDIR)
 
 # In-memory response cache per user (for regenerate/tts/file/quick actions)
 LAST: Dict[int, dict] = {}
+# Cooperative cancellation: user ids that pressed /cancel or the Stop button
+CANCELLED: set = set()
+# Sliding window of request timestamps per user, for rate limiting
+_RATE: Dict[int, List[float]] = {}
 # Chat history (last N exchanges) per user for /export
 HISTORY: Dict[int, List[dict]] = {}
 MAX_HISTORY = 100
@@ -126,6 +134,42 @@ def load_state():
             log.info("Loaded state for %d user(s)", len(STATE))
         except Exception as e:
             log.warning("state load failed: %s", e)
+    load_history()
+
+
+def load_history():
+    """Restore chat history so /export and Regen survive a restart."""
+    if not os.path.exists(HISTORY_FILE):
+        return
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        for k, v in raw.items():
+            if isinstance(v, list):
+                HISTORY[int(k)] = v[-MAX_HISTORY:]
+        log.info("Loaded history for %d user(s)", len(HISTORY))
+    except Exception as e:
+        log.warning("history load failed: %s", e)
+
+
+def save_history():
+    """Atomic write, same approach as save_state()."""
+    try:
+        d = os.path.dirname(os.path.abspath(HISTORY_FILE)) or "."
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".hist-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in HISTORY.items()}, f,
+                          ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, HISTORY_FILE)
+        except Exception:
+            try: os.unlink(tmp)
+            except: pass
+            raise
+    except Exception as e:
+        log.warning("history save failed: %s", e)
 
 def save_state():
     """Atomic write — a crash mid-save can no longer corrupt state.json."""
@@ -175,7 +219,7 @@ def status_text(s: UserState) -> str:
         names = ", ".join(f[1] for f in s.attached_files)
         lines.append(f"📎 Attached: <b>{html.escape(names)}</b>")
     lines.append("")
-    lines.append("👇 <i>Message/voice/photo/file/URL bhejo — sab handle karta hoon.</i>")
+    lines.append("👇 <i>Send a message, voice note, photo, file or URL — I handle them all.</i>")
     return "\n".join(lines)
 
 
@@ -275,13 +319,13 @@ def chats_kb(chats: list, page: int = 0, per_page: int = 8) -> InlineKeyboardMar
 
 HELP_TEXT = (
 "<b>🤖 DeepSeek Bot — Complete Guide</b>\n\n"
-"<b>Input types (sab handle karta hoon):</b>\n"
+"<b>Input types (all supported):</b>\n"
 "📝 Text — normal chat\n"
 "🎤 Voice — Whisper transcribe → DeepSeek\n"
-"🖼 Photo — Vision mode me analyze\n"
+"🖼 Photo — OCR text extraction\n"
 "📎 Document — upload + question caption\n"
-"🔗 URL — auto fetch aur summarize\n"
-"▶️ YouTube link — transcript se summary\n\n"
+"🔗 URL — auto fetch and summarize\n"
+"▶️ YouTube link — summary from transcript\n\n"
 "<b>Modes:</b>\n"
 "🚀 Instant — fast, supports search+files\n"
 "💎 Expert — deep reasoning\n"
@@ -289,15 +333,15 @@ HELP_TEXT = (
 "<b>Personas 🎭 (9 options):</b>\n"
 "Default, Tutor, Coder, Dost, Writer, Translator, "
 "Comedian, Scientist, Startup Coach, Health Info\n\n"
-"<b>Response buttons (har jawab pe):</b>\n"
-"🔊 <b>Speak</b> — voice message me sun lo\n"
-"📄 <b>File</b> — .md file me download\n"
-"🔁 <b>Regen</b> — same sawaal, alag jawab\n"
+"<b>Response buttons (on every reply):</b>\n"
+"🔊 <b>Speak</b> — listen as a voice message\n"
+"📄 <b>File</b> — download as a .md file\n"
+"🔁 <b>Regen</b> — same question, fresh answer\n"
 "⚡ <b>Quick actions</b> — Translate/Summarize/Rephrase/Explain/Continue\n\n"
 "<b>Toggles:</b>\n"
 "🧠 Think — reasoning chain\n"
 "🌐 Search — real-time web\n"
-"🔊 Voice-reply — sab replies voice me bhi\n"
+"🔊 Voice-reply — also send every reply as audio\n"
 "👤 Male/Female voice\n"
 "🔗 URL fetch — automatic vs manual\n\n"
 "<b>Chat mgmt:</b>\n"
@@ -305,9 +349,9 @@ HELP_TEXT = (
 "<b>Long responses:</b>\n"
 "3800–10000 chars → multi-bubble\n"
 "10000+ → auto .md file\n\n"
-"<b>Slash commands (sirf 2):</b>\n"
-"/start — menu\n/help — ye page\n\n"
-"<i>💡 Tip: Simply text likho, main sab detect karta hoon.</i>"
+"<b>Slash commands:</b>\n"
+"/start — menu\n/help — this page\n/cancel — stop the running task\n\n"
+"<i>💡 Tip: just type normally — input type is detected automatically.</i>"
 )
 
 
@@ -338,6 +382,28 @@ def record_history(uid: int, role: str, text: str):
     lst.append({"role": role, "text": text, "ts": time.time()})
     if len(lst) > MAX_HISTORY:
         del lst[:len(lst) - MAX_HISTORY]
+    save_history()
+
+
+# ---------- Rate limiting ----------
+def rate_check(uid: int) -> Optional[int]:
+    """
+    Sliding-window limiter. Returns None if allowed, else seconds to wait.
+
+    Protects the single shared DeepSeek account: bursts of requests look like
+    abuse upstream and can get the session token throttled or banned.
+    """
+    if RATE_LIMIT <= 0:
+        return None
+    now = time.time()
+    hits = _RATE.setdefault(uid, [])
+    cutoff = now - RATE_WINDOW
+    while hits and hits[0] < cutoff:
+        hits.pop(0)
+    if len(hits) >= RATE_LIMIT:
+        return max(1, int(hits[0] + RATE_WINDOW - now) + 1)
+    hits.append(now)
+    return None
 
 
 # ---------- Slash commands ----------
@@ -345,6 +411,17 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("🚫 Personal bot."); return
     await send_menu(update, get_state(update.effective_user.id))
+
+async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Stop whatever DeepSeek request is currently streaming."""
+    uid = update.effective_user.id
+    if not is_owner(uid): return
+    if user_lock(uid).locked():
+        CANCELLED.add(uid)
+        await update.message.reply_text("⏹ Stopping the current request…")
+    else:
+        await update.message.reply_text("Nothing is running right now.")
+
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id): return
@@ -454,7 +531,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not hist:
             await q.answer("No history yet", show_alert=True); return
         async with Progress(ctx.bot, q.message.chat_id, "📤 Chat export",
-                            steps=["Markdown banana", "File bhejna"]) as p:
+                            steps=["Building Markdown", "Sending file"]) as p:
             await p.step(0, f"{len(hist)} messages")
             content = "# DeepSeek Chat Export\n\n"
             for h in hist:
@@ -564,8 +641,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not last or not last.get('raw_answer'):
             await q.answer("No response cached", show_alert=True); return
         await q.answer("Sending file…")
-        async with Progress(ctx.bot, q.message.chat_id, "📄 File bana raha hoon",
-                            steps=["Markdown banana", "Bhejna"]) as p:
+        async with Progress(ctx.bot, q.message.chat_id, "📄 Building file",
+                            steps=["Building Markdown", "Sending"]) as p:
             await p.step(0, f"{len(last['raw_answer']):,} chars")
             await p.step(1)
             await _send_response_file(ctx, q.message.chat_id,
@@ -583,6 +660,14 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx=ctx, chat_id=q.message.chat_id, user_id=q.from_user.id,
             prompt=last['prompt'], reply_to_msg_id=None, is_regen=True,
         )
+        return
+
+    if data == "rsp:stop":
+        if user_lock(q.from_user.id).locked():
+            CANCELLED.add(q.from_user.id)
+            await q.answer("Stopping…")
+        else:
+            await q.answer("Nothing is running")
         return
 
     if data == "rsp:actions":
@@ -640,7 +725,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     async with Progress(
         ctx.bot, update.effective_chat.id, "🎤 Voice message",
-        steps=["Audio download", "Whisper transcribe", "DeepSeek ko bhejna"],
+        steps=["Downloading audio", "Transcribing (Whisper)", "Sending to DeepSeek"],
         reply_to=msg.message_id,
     ) as p:
         try:
@@ -656,10 +741,10 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text, lang = await asyncio.to_thread(transcribe, tmp_path)
         except Exception as e:
             log.exception("STT failed")
-            await p.done(f"❌ <b>Voice samajh nahi aayi</b>\n\n"
+            await p.done(f"❌ <b>Could not understand the audio</b>\n\n"
                          f"{html.escape(str(e))[:300]}\n\n"
-                         f"<i>💡 faster-whisper install hai? "
-                         f"requirements.txt check karo.</i>")
+                         f"<i>💡 Is faster-whisper installed? "
+                         f"Check requirements.txt.</i>")
             return
         finally:
             if tmp_path:
@@ -667,9 +752,9 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except: pass
 
         if not text or not text.strip():
-            await p.done("🎤 <b>Koi speech detect nahi hui.</b>\n\n"
-                         "<i>Saaf bolo, background noise kam karo, "
-                         "aur 1 second se lamba bolo.</i>")
+            await p.done("🎤 <b>No speech detected.</b>\n\n"
+                         "<i>Speak clearly, reduce background noise, "
+                         "and record for longer than a second.</i>")
             return
 
         await p.step(2, text[:80])
@@ -713,7 +798,7 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with Progress(
         ctx.bot, update.effective_chat.id,
         f"📤 {'Photo' if is_photo else 'File'}: {file_name[:40]}",
-        steps=["Telegram se download", "DeepSeek pe upload", "Parse / OCR"],
+        steps=["Downloading from Telegram", "Uploading to DeepSeek", "Parsing / OCR"],
         reply_to=msg.message_id,
     ) as p:
         try:
@@ -724,9 +809,9 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 tmp_path = tmp.name
             await tg_file.download_to_drive(tmp_path)
 
-            await p.step(1, "DeepSeek server pe bhej raha hoon")
-            await p.step(2, "OCR / text extraction chal raha hai"
-                            if is_photo else "Document parse ho raha hai")
+            await p.step(1, "Sending to DeepSeek servers")
+            await p.step(2, "Running OCR / text extraction"
+                            if is_photo else "Parsing document")
             fid, fname, err = await asyncio.to_thread(ds.upload_file_ex, tmp_path)
         finally:
             if tmp_path:
@@ -735,19 +820,19 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if not fid:
             tip = (
-                "\n\n<b>💡 Photo bhejne ke liye:</b>\n"
-                "• DeepSeek photo ko <b>sirf OCR</b> karta hai — usme saaf "
-                "padhne layak <b>text</b> hona chahiye\n"
-                "• Screenshot, document scan, notes, bill — ye chalega ✅\n"
-                "• Selfie, scenery, meme, logo — ye nahi chalega ❌\n"
-                "• Photo ko <b>Document/File</b> ki tarah bhejo (compress mat "
-                "hone do) — quality better rehti hai"
+                "\n\n<b>💡 Tips for sending photos:</b>\n"
+                "• DeepSeek only runs <b>OCR</b> on images — they must contain "
+                "clearly readable <b>text</b>\n"
+                "• Screenshots, document scans, notes, bills — these work ✅\n"
+                "• Selfies, scenery, memes, logos — these do not ❌\n"
+                "• Send the photo as a <b>Document/File</b> so Telegram does not "
+                "compress it — quality stays better"
             ) if is_photo else (
-                "\n\n<i>💡 txt / pdf / docx / csv best chalte hain. "
-                "Scanned PDF me text layer hona chahiye.</i>"
+                "\n\n<i>💡 txt / pdf / docx / csv work best. "
+                "Scanned PDFs need a text layer.</i>"
             )
             # keep the failure visible instead of deleting the bar
-            await p.done(f"❌ <b>Upload nahi ho paaya</b>\n\n"
+            await p.done(f"❌ <b>Upload failed</b>\n\n"
                          f"{html.escape(err or 'Unknown error')}{tip}")
             return
         # success → bar auto-deletes on context exit
@@ -761,7 +846,7 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await msg.reply_html(
-            f"✅ Attached: <b>{html.escape(fname)}</b>\nAb sawaal likho.")
+            f"✅ Attached: <b>{html.escape(fname)}</b>\nNow ask your question.")
 
 
 # ---------- Text ----------
@@ -792,10 +877,10 @@ async def _try_url_summarize(ctx, update, url: str, original_text: str) -> bool:
     prompt = None
 
     async with Progress(
-        ctx.bot, update.effective_chat.id, f"🔗 {kind} padh raha hoon",
-        steps=([f"Transcript nikalna", "Text saaf karna", "DeepSeek ko bhejna"]
+        ctx.bot, update.effective_chat.id, f"🔗 Reading {kind}",
+        steps=(["Fetching transcript", "Cleaning text", "Sending to DeepSeek"]
                if yt_id else
-               ["Page download", "Article extract", "DeepSeek ko bhejna"]),
+               ["Downloading page", "Extracting article", "Sending to DeepSeek"]),
         reply_to=msg.message_id,
     ) as p:
         try:
@@ -809,12 +894,12 @@ async def _try_url_summarize(ctx, update, url: str, original_text: str) -> bool:
 
             if not text or len(text) < 50:
                 await p.done(
-                    f"❌ <b>Content nahi mila</b>\n\n"
+                    f"❌ <b>No content found</b>\n\n"
                     f"{html.escape(url[:100])}\n\n"
-                    + ("<i>💡 Is video pe transcript/captions off hain, "
-                       "ya video private hai.</i>" if yt_id else
-                       "<i>💡 Page JavaScript se load hota hai ya login "
-                       "maangta hai — bot uska text nahi padh sakta.</i>"))
+                    + ("<i>💡 This video has transcripts/captions disabled, "
+                       "or it is private.</i>" if yt_id else
+                       "<i>💡 The page is JavaScript-rendered or requires a "
+                       "login — the bot cannot read its text.</i>"))
                 return False
 
             await p.step(1, f"{len(text):,} characters mile")
@@ -837,9 +922,9 @@ async def _try_url_summarize(ctx, update, url: str, original_text: str) -> bool:
         except Exception as e:
             log.warning("URL fetch failed: %s", e)
             await p.done(
-                f"⚠️ <b>{kind} fetch fail hui</b>\n\n"
+                f"⚠️ <b>{kind} fetch failed</b>\n\n"
                 f"{html.escape(str(e))[:250]}\n\n"
-                f"<i>Message ko normal sawaal ki tarah bhej raha hoon…</i>")
+                f"<i>Falling back to treating this as a normal question…</i>")
             return False
 
     await _process_prompt_chat(
@@ -858,12 +943,12 @@ async def _send_tts(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
 
     n_chars = len(text)
     async with Progress(
-        ctx.bot, chat_id, "🔊 Voice bana raha hoon",
-        steps=["Text saaf karna", "Awaaz generate", "Telegram pe bhejna"],
+        ctx.bot, chat_id, "🔊 Generating voice",
+        steps=["Cleaning text", "Generating speech", "Sending to Telegram"],
     ) as p:
         try:
             await p.step(0, f"{n_chars:,} characters")
-            await p.step(1, f"{'♀ Female' if female else '♂ Male'} voice "
+            await p.step(1, f"{'Female' if female else 'Male'} voice "
                             f"· edge-tts")
             await synthesize_ogg(text, ogg_path, prefer_female=female)
 
@@ -873,7 +958,7 @@ async def _send_tts(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
             # bar deletes itself here; the voice note is the result
         except Exception as e:
             log.exception("TTS failed")
-            await p.done(f"❌ <b>Voice nahi ban paayi</b>\n\n"
+            await p.done(f"❌ <b>Voice generation failed</b>\n\n"
                          f"{html.escape(str(e))[:300]}")
         finally:
             try: os.unlink(ogg_path)
@@ -910,12 +995,24 @@ async def _process_prompt_chat(*, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
     if not prompt or not prompt.strip():
         await ctx.bot.send_message(chat_id=chat_id, text="Empty prompt."); return
 
+    wait = rate_check(user_id)
+    if wait:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(f"🐢 <b>Slow down a little</b>\n\n"
+                  f"Limit is {RATE_LIMIT} requests per {RATE_WINDOW}s — this "
+                  f"protects the shared DeepSeek token from being throttled.\n"
+                  f"<i>Try again in {wait}s.</i>"),
+            parse_mode="HTML")
+        return
+
     lock = user_lock(user_id)
     if lock.locked():
         await ctx.bot.send_message(
             chat_id=chat_id,
-            text="⏳ <i>Pichla jawab abhi chal raha hai — ye uske baad "
-                 "process hoga.</i>", parse_mode="HTML")
+            text="⏳ <i>Your previous request is still running — this one is "
+                 "queued and will start right after.</i>", parse_mode="HTML")
+    CANCELLED.discard(user_id)
     async with lock:
         await _process_prompt_chat_inner(
             ctx=ctx, chat_id=chat_id, user_id=user_id, prompt=prompt,
@@ -964,8 +1061,8 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     # placeholder in-place, so the answer simply overwrites it — nothing to
     # clean up and no extra message in the chat.
     waiter = Waiter(placeholder,
-                    "Files parse ho rahi hain, DeepSeek soch raha hai"
-                    if file_ids else "DeepSeek soch raha hai")
+                    "Parsing files, DeepSeek is thinking"
+                    if file_ids else "DeepSeek is thinking")
     await waiter.start()
 
     think_buf = ""
@@ -1009,6 +1106,14 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     try:
         got_any = False
         async for ev in stream_iter():
+            if user_id in CANCELLED:
+                CANCELLED.discard(user_id)
+                await waiter.stop()
+                await safe_edit(messages[-1],
+                                 (md_to_tg_html(current_text) + "\n\n<i>⏹ Stopped.</i>")
+                                 if current_text else "⏹ <i>Stopped.</i>",
+                                 kb=response_footer_kb(has_text=bool(current_text)))
+                return
             if not got_any:
                 # first event from DeepSeek → stop the waiting animation so it
                 # can't overwrite the streaming answer
@@ -1063,9 +1168,9 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
         if not got_any:
             await waiter.stop()
             await safe_edit(messages[-1],
-                             "❌ <b>DeepSeek se koi jawab nahi aaya.</b>\n\n"
-                             "<i>💡 Token expire ho sakta hai, ya DeepSeek "
-                             "server busy hai. 'New Chat' try karo.</i>",
+                             "❌ <b>No response from DeepSeek.</b>\n\n"
+                             "<i>💡 Your token may have expired, or DeepSeek "
+                             "servers are busy. Try 'New Chat'.</i>",
                              kb=response_footer_kb(has_text=False))
             return
 
@@ -1128,18 +1233,36 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
 async def _post_init(app):
     try:
         await app.bot.set_my_commands([
-            BotCommand("start", "Menu kholo"),
-            BotCommand("help", "Guide"),
+            BotCommand("start", "Open the menu"),
+            BotCommand("help", "Usage guide"),
+            BotCommand("cancel", "Stop the running task"),
         ])
-        await app.bot.send_message(
-            chat_id=OWNER_ID,
-            text="🚀 <b>Bot v4 LIVE!</b>\n\n"
-                 "✨ New: Personas 🎭, URL/YouTube summarize 🔗, "
-                 "Quick actions ⚡, Export 📤\n\n"
-                 "Fixes: voice quality upgraded, single-voice-message bug fixed.\n\n"
-                 "/start for menu.",
-            parse_mode="HTML",
-        )
+        # Only greet on a genuinely new deployment, not on every restart —
+        # hosts like Render restart often and the message became spam.
+        stamp = os.path.join(WORKDIR, ".last_boot_notice")
+        version = "v5"
+        seen = ""
+        try:
+            with open(stamp, encoding="utf-8") as f:
+                seen = f.read().strip()
+        except Exception:
+            pass
+        if seen != version:
+            await app.bot.send_message(
+                chat_id=OWNER_ID,
+                text="🚀 <b>Bot v5 is live</b>\n\n"
+                     "✨ New: progress bars on every long task, /cancel, "
+                     "persistent history, rate limiting\n"
+                     "🐛 Fixed: photo/file uploads, silent crashes, "
+                     "blocked buttons\n\n"
+                     "/start for the menu.",
+                parse_mode="HTML",
+            )
+            try:
+                with open(stamp, "w", encoding="utf-8") as f:
+                    f.write(version)
+            except Exception:
+                pass
     except Exception as e:
         log.warning("post_init: %s", e)
 
@@ -1162,7 +1285,7 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat:
             chat_id = update.effective_chat.id
         if update.callback_query:
-            try: await update.callback_query.answer("Error — dobara try karo",
+            try: await update.callback_query.answer("Something went wrong — try again",
                                                      show_alert=True)
             except Exception: pass
     if chat_id is None or chat_id != OWNER_ID:
@@ -1170,11 +1293,11 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await ctx.bot.send_message(
             chat_id=chat_id,
-            text=("⚠️ <b>Kuch galat ho gaya</b>\n\n"
+            text=("⚠️ <b>Something went wrong</b>\n\n"
                   f"<code>{html.escape(type(err).__name__)}: "
                   f"{html.escape(str(err))[:250]}</code>\n\n"
-                  "<i>Bot chal raha hai — dobara try karo. "
-                  "Baar baar aaye to /start dabao.</i>"),
+                  "<i>The bot is still running — please try again. "
+                  "If this keeps happening, press /start.</i>"),
             parse_mode="HTML")
     except Exception:
         pass
@@ -1188,6 +1311,7 @@ def build_app():
            .build())
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_media))

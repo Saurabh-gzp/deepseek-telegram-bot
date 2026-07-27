@@ -182,19 +182,19 @@ class DeepSeekClient:
     # Human-readable reasons surfaced to the bot UI
     _FAIL_REASON = {
         'CONTENT_EMPTY':
-            "DeepSeek is image se koi text nahi nikaal paaya.\n"
-            "DeepSeek ka file upload sirf OCR karta hai — photo me saaf padhne "
-            "layak likhaai honi chahiye. Blank / pure-graphic images kaam nahi karengi.",
-        'CONTENT_TOO_LONG': "File bahut badi hai — DeepSeek ki limit se zyada content hai.",
-        'UNSUPPORTED': "Is file format ko DeepSeek support nahi karta.",
-        'AUDIT_FAILED': "DeepSeek ke content moderation ne is file ko reject kar diya.",
-        'AUDIT_BLOCKED': "DeepSeek ke content moderation ne is file ko block kar diya.",
-        'PARSE_FAILED': "DeepSeek is file ko parse nahi kar paaya (file corrupt ho sakti hai).",
-        'FAILED': "DeepSeek par file processing fail ho gayi.",
-        'EXPIRED': "File upload expire ho gaya, dobara bhejo.",
-        'TIMEOUT': "DeepSeek ne time pe file parse nahi ki. Thodi der baad try karo.",
-        'UPLOAD_HTTP': "Upload request reject ho gayi (DeepSeek server ne error diya).",
-        'POW': "Security challenge (PoW) solve nahi hua. Node.js check karo.",
+            "DeepSeek could not extract any text from this image.\n"
+            "Its file upload is OCR-only — the image must contain clearly "
+            "readable text. Blank or purely graphical images will not work.",
+        'CONTENT_TOO_LONG': "File is too large — it exceeds DeepSeek's content limit.",
+        'UNSUPPORTED': "DeepSeek does not support this file format.",
+        'AUDIT_FAILED': "DeepSeek's content moderation rejected this file.",
+        'AUDIT_BLOCKED': "DeepSeek's content moderation blocked this file.",
+        'PARSE_FAILED': "DeepSeek could not parse this file (it may be corrupt).",
+        'FAILED': "File processing failed on DeepSeek's side.",
+        'EXPIRED': "The upload expired — please send the file again.",
+        'TIMEOUT': "DeepSeek did not finish parsing in time. Try again shortly.",
+        'UPLOAD_HTTP': "The upload request was rejected by the DeepSeek server.",
+        'POW': "Could not solve the security challenge (PoW). Check that Node.js is installed.",
     }
 
     def upload_file(self, file_path: str, mime_type: str = None,

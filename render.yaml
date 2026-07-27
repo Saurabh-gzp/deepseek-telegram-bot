@@ -18,5 +18,7 @@ services:
         value: "1"
       - key: CONCURRENCY
         value: "8"
+      - key: RATE_LIMIT
+        value: "20"
     autoDeploy: true
     healthCheckPath: /health

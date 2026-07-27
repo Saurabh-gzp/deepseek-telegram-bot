@@ -299,7 +299,7 @@ class Waiter:
     Unlike Progress it never sends or deletes anything — it just animates a
     message that the caller already owns and will overwrite with real content.
 
-        w = Waiter(placeholder, "DeepSeek soch raha hai")
+        w = Waiter(placeholder, "DeepSeek is thinking")
         await w.start()
         ...
         await w.stop()      # caller then edits `placeholder` with the answer

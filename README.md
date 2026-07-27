@@ -20,7 +20,13 @@ A powerful, button-driven personal Telegram bot backed by **DeepSeek** — with 
 | 📤 **Export chat** | Download entire history as Markdown |
 | 📊 **Usage stats** | Message count, char counts |
 | 🩺 **Health-check server** | Built-in HTTP endpoint for Render/Fly.io |
-| 🛡 **Owner-only** | Bot replies only to your Telegram user ID |
+| 👥 **Multi-user** | Invite-only with approvals, or open to everyone |
+| 🛠 **Admin panel** | `/admin` — users, stats, keys, broadcast, access mode |
+| 🔑 **Key pool** | Each DeepSeek key = one more user chatting *at the same time* |
+| 🔐 **Private chats** | Every query is scoped by user ID — nobody sees anyone else's chat |
+| 🧹 **Nightly wipe** | All conversations auto-delete at midnight (24h TTL backstop) |
+| 📣 **Broadcast** | Rate-limited to Telegram's rules, auto-detects users who blocked the bot |
+| 🗄 **MongoDB** | Users, keys, history and config persisted |
 | 📝 **Markdown → Telegram HTML** | Bold, italic, code, links, blockquotes render properly |
 | 🎨 **Button-only UI** | Three slash commands (`/start`, `/help`, `/cancel`) — everything else is inline buttons |
 | ⏳ **Live progress bars** | Every slow task shows an animated bar that deletes itself when done |

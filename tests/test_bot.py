@@ -2,7 +2,7 @@
 import asyncio, sys, os
 from unittest.mock import AsyncMock, MagicMock, patch
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["STATE_FILE"] = "test_state.json"
 if os.path.exists("test_state.json"): os.unlink("test_state.json")
 

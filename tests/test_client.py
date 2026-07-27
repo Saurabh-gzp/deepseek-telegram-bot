@@ -1,12 +1,13 @@
 """Quick smoke test for DeepSeekClient — no bot."""
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 from deepseek_client import DeepSeekClient, RULES
 
 TOKEN = os.getenv("DEEPSEEK_TOKEN", "")
 
 print("→ Init client…")
-c = DeepSeekClient(TOKEN, workdir=os.path.dirname(__file__))
+c = DeepSeekClient(TOKEN, workdir=ROOT)
 print("✓ WASM & solver ready")
 
 print("→ list_chats()…")

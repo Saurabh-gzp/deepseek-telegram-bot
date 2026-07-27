@@ -3,7 +3,8 @@ End-to-end integration tests for v4 — real DeepSeek + real TTS + real Whisper.
 Also tests: URL fetch (with real trafilatura), YouTube (if available).
 """
 import sys, os, asyncio, tempfile
-sys.path.insert(0, os.path.dirname(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 os.environ["STATE_FILE"] = "e2e_state.json"
 if os.path.exists("e2e_state.json"): os.unlink("e2e_state.json")
 
@@ -18,7 +19,7 @@ async def main():
     print("\n===== 1. Real DeepSeek chat =====")
     from deepseek_client import DeepSeekClient
     c = DeepSeekClient(os.getenv("DEEPSEEK_TOKEN", ""),
-                       workdir=os.path.dirname(__file__))
+                       workdir=ROOT)
     sid = c.create_chat()
     ok("session created", sid is not None)
 

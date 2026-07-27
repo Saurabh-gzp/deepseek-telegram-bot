@@ -115,10 +115,10 @@ docker run -d --name dsbot \
 ## 🧪 Testing
 
 ```bash
-python test_bot.py       # 60+ handler tests (offline, mocked)
-python test_md.py        # Markdown → Telegram HTML (18 cases)
-python test_client.py    # Real DeepSeek smoke test (needs DEEPSEEK_TOKEN)
-python test_e2e.py       # Full pipeline: DeepSeek + TTS + Whisper + URL
+python tests/test_bot.py       # 60 handler tests (offline, mocked)
+python tests/test_md.py        # Markdown → Telegram HTML (18 cases)
+python tests/test_client.py    # Real DeepSeek smoke test (needs DEEPSEEK_TOKEN)
+python tests/test_e2e.py       # Full pipeline: DeepSeek + TTS + Whisper + URL
 ```
 
 ---

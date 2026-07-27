@@ -22,7 +22,12 @@ A powerful, button-driven personal Telegram bot backed by **DeepSeek** — with 
 | 🩺 **Health-check server** | Built-in HTTP endpoint for Render/Fly.io |
 | 🛡 **Owner-only** | Bot replies only to your Telegram user ID |
 | 📝 **Markdown → Telegram HTML** | Bold, italic, code, links, blockquotes render properly |
-| 🎨 **Button-only UI** | Just two slash commands (`/start`, `/help`) — everything else is inline buttons |
+| 🎨 **Button-only UI** | Three slash commands (`/start`, `/help`, `/cancel`) — everything else is inline buttons |
+| ⏳ **Live progress bars** | Every slow task shows an animated bar that deletes itself when done |
+| ⏹ **Cancellable** | `/cancel` stops a long answer mid-stream |
+| 💾 **Persistent history** | Chat log survives restarts — Export & Regen keep working |
+| 🐢 **Rate limiting** | Sliding window guards the shared DeepSeek token |
+| 🛟 **Crash-safe** | Global error handler + atomic state writes |
 
 ## 🚀 Deploy on Render (free, 5 minutes)
 

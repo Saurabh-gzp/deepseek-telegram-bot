@@ -16,5 +16,7 @@ services:
         value: small
       - key: ENABLE_HEALTH
         value: "1"
+      - key: CONCURRENCY
+        value: "8"
     autoDeploy: true
     healthCheckPath: /health

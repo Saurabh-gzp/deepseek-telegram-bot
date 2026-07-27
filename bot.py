@@ -34,7 +34,7 @@ from typing import Optional, Dict, List
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
                       BotCommand, LinkPreviewOptions)
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict, NetworkError, TimedOut
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters,
@@ -61,6 +61,8 @@ if not TELEGRAM_TOKEN or not DEEPSEEK_TOKEN or not OWNER_ID:
         "Copy .env.example → .env and fill in the values, or set them in "
         "your host's dashboard (Render / Railway / etc.)."
     )
+
+CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
 
 MAX_TG_MSG = 3800
 FILE_THRESHOLD = 10000
@@ -102,6 +104,16 @@ class UserState:
 
 STATE: Dict[int, UserState] = {}
 
+# One lock per user. With concurrent_updates>1 two messages could otherwise
+# interleave and corrupt parent_msg_id (DeepSeek's conversation pointer).
+_LOCKS: Dict[int, asyncio.Lock] = {}
+
+def user_lock(uid: int) -> asyncio.Lock:
+    lk = _LOCKS.get(uid)
+    if lk is None:
+        lk = _LOCKS[uid] = asyncio.Lock()
+    return lk
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -116,9 +128,21 @@ def load_state():
             log.warning("state load failed: %s", e)
 
 def save_state():
+    """Atomic write — a crash mid-save can no longer corrupt state.json."""
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({str(k): asdict(v) for k, v in STATE.items()}, f, indent=2)
+        data = {str(k): asdict(v) for k, v in STATE.items()}
+        d = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".state-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, STATE_FILE)      # atomic on POSIX
+        except Exception:
+            try: os.unlink(tmp)
+            except: pass
+            raise
     except Exception as e:
         log.warning("state save failed: %s", e)
 
@@ -886,6 +910,24 @@ async def _process_prompt_chat(*, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
     if not prompt or not prompt.strip():
         await ctx.bot.send_message(chat_id=chat_id, text="Empty prompt."); return
 
+    lock = user_lock(user_id)
+    if lock.locked():
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text="⏳ <i>Pichla jawab abhi chal raha hai — ye uske baad "
+                 "process hoga.</i>", parse_mode="HTML")
+    async with lock:
+        await _process_prompt_chat_inner(
+            ctx=ctx, chat_id=chat_id, user_id=user_id, prompt=prompt,
+            reply_to_msg_id=reply_to_msg_id, is_regen=is_regen,
+            is_quick_action=is_quick_action)
+
+
+async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
+                                      chat_id: int, user_id: int, prompt: str,
+                                      reply_to_msg_id: Optional[int],
+                                      is_regen: bool = False,
+                                      is_quick_action: bool = False):
     s = get_state(user_id)
 
     if not s.session_id:
@@ -1102,14 +1144,55 @@ async def _post_init(app):
         log.warning("post_init: %s", e)
 
 
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    """Catch-all: without this a single unhandled exception kills the update
+    silently and the user is left staring at a dead chat."""
+    err = ctx.error
+    log.exception("Unhandled exception", exc_info=err)
+
+    if isinstance(err, Conflict):
+        log.error("Conflict: another instance of this bot is polling. "
+                  "Stop the other copy (local run / old Render deploy).")
+        return
+    if isinstance(err, (TimedOut, NetworkError)):
+        return   # transient, python-telegram-bot retries by itself
+
+    chat_id = None
+    if isinstance(update, Update):
+        if update.effective_chat:
+            chat_id = update.effective_chat.id
+        if update.callback_query:
+            try: await update.callback_query.answer("Error — dobara try karo",
+                                                     show_alert=True)
+            except Exception: pass
+    if chat_id is None or chat_id != OWNER_ID:
+        return
+    try:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=("⚠️ <b>Kuch galat ho gaya</b>\n\n"
+                  f"<code>{html.escape(type(err).__name__)}: "
+                  f"{html.escape(str(err))[:250]}</code>\n\n"
+                  "<i>Bot chal raha hai — dobara try karo. "
+                  "Baar baar aaye to /start dabao.</i>"),
+            parse_mode="HTML")
+    except Exception:
+        pass
+
+
 def build_app():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
+    app = (ApplicationBuilder()
+           .token(TELEGRAM_TOKEN)
+           .concurrent_updates(CONCURRENCY)   # buttons no longer block on a
+           .post_init(_post_init)             # slow DeepSeek reply
+           .build())
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     return app
 
 

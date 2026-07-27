@@ -27,6 +27,8 @@ import logging
 import os
 import re
 import secrets
+import signal
+import socket
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -73,6 +75,11 @@ RATE_LIMIT = int(os.getenv("RATE_LIMIT", "20"))
 RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))
 # How long a user waits for a free DeepSeek key before being told to retry
 KEY_WAIT_TIMEOUT = float(os.getenv("KEY_WAIT_TIMEOUT", "180"))
+# Single-poller guard: how long to wait for a previous deploy to exit, and
+# whether to forcibly take the lease if it will not.
+LOCK_WAIT = float(os.getenv("LOCK_WAIT", "75"))
+FORCE_POLL = os.getenv("FORCE_POLL", "0") == "1"
+INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 MAX_TG_MSG = 3800
 FILE_THRESHOLD = 10000
@@ -1367,7 +1374,7 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await tg_file.download_to_drive(tmp_path)
 
             await p.step(1, "Sending to DeepSeek servers")
-            await p.step(2, "Running OCR / text extraction"
+            await p.step(2, "Reading text from the image (OCR)"
                             if is_photo else "Parsing document")
             res = await ds_op(update.effective_user.id, 'upload_file_ex', tmp_path,
                               timeout=KEY_WAIT_TIMEOUT)
@@ -1383,13 +1390,13 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if not fid:
             tip = (
-                "\n\n<b>💡 Tips for sending photos:</b>\n"
-                "• DeepSeek only runs <b>OCR</b> on images — they must contain "
-                "clearly readable <b>text</b>\n"
-                "• Screenshots, document scans, notes, bills — these work ✅\n"
-                "• Selfies, scenery, memes, logos — these do not ❌\n"
-                "• Send the photo as a <b>Document/File</b> so Telegram does not "
-                "compress it — quality stays better"
+                "\n\n<b>What works ✅</b>\n"
+                "Screenshots · document scans · handwritten notes · bills · "
+                "receipts · anything with readable writing\n\n"
+                "<b>What doesn't ❌</b>\n"
+                "Selfies · scenery · pets · memes · logos · plain graphics\n\n"
+                "<i>💡 Sending it as a <b>File</b> instead of a photo stops "
+                "Telegram compressing it, which helps blurry or small text.</i>"
             ) if is_photo else (
                 "\n\n<i>💡 txt / pdf / docx / csv work best. "
                 "Scanned PDFs need a text layer.</i>"
@@ -1889,8 +1896,13 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled exception", exc_info=err)
 
     if isinstance(err, Conflict):
-        log.error("Conflict: another instance of this bot is polling. "
-                  "Stop the other copy (local run / old Render deploy).")
+        # Two pollers on one token. Telegram hands each getUpdates call to a
+        # random one, so messages appear to be answered intermittently.
+        log.error(
+            "Conflict: another process is polling with this bot token. "
+            "Only one instance may run. Check for an old Render deploy, a "
+            "second service, or a local copy still running. This instance is "
+            "%s.", INSTANCE_ID)
         return
     if isinstance(err, (TimedOut, NetworkError)):
         return   # transient, python-telegram-bot retries by itself
@@ -1936,9 +1948,73 @@ def build_app():
     return app
 
 
+async def _claim_polling_lock() -> bool:
+    """
+    Make sure we are the only poller.
+
+    A redeploy overlaps with the dying instance for a few seconds, so we retry
+    for a while before giving up. If another *live* instance holds the lease we
+    refuse to start polling rather than fighting it — that fight is what
+    produces 'Conflict: terminated by other getUpdates request' and makes the
+    bot answer only every other message.
+    """
+    deadline = time.time() + LOCK_WAIT
+    while True:
+        if await db.acquire_instance_lock(INSTANCE_ID):
+            log.info("Polling lock acquired (instance %s)", INSTANCE_ID)
+            return True
+        holder = await db.instance_lock_holder() or {}
+        age = time.time() - holder.get("heartbeat", 0)
+        if time.time() >= deadline:
+            if FORCE_POLL:
+                log.warning("Forcing takeover from %s (idle %.0fs)",
+                            holder.get("owner"), age)
+                await db.acquire_instance_lock(INSTANCE_ID, force=True)
+                return True
+            log.error(
+                "Another instance (%s) is already polling, last seen %.0fs "
+                "ago. Not starting a second poller — stop the other copy, or "
+                "set FORCE_POLL=1 to take over.", holder.get("owner"), age)
+            return False
+        log.info("Waiting for the previous instance to exit (%s, idle %.0fs)…",
+                 holder.get("owner"), age)
+        await asyncio.sleep(3)
+
+
+async def _lock_heartbeat():
+    """Keep the lease alive; stop the process if we lose it."""
+    while True:
+        await asyncio.sleep(db.LOCK_REFRESH)
+        try:
+            if not await db.refresh_instance_lock(INSTANCE_ID):
+                log.error("Lost the polling lock — another instance took "
+                          "over. Shutting this one down.")
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+        except Exception as e:
+            log.warning("lock heartbeat failed: %s", e)
+
+
 async def _run_with_health():
     """Run bot polling + tiny HTTP server (for Render Web Service)."""
     from health import start_health_server
+
+    # Render sends SIGTERM on redeploy. Releasing the lease here means the
+    # replacement instance starts polling immediately instead of waiting out
+    # the lock TTL.
+    stopping = asyncio.Event()
+
+    def _on_signal(*_a):
+        log.info("Shutdown signal received — releasing polling lock.")
+        stopping.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_signal)
+        except (NotImplementedError, RuntimeError):
+            pass
+
     app = build_app()
     runner = await start_health_server()
     try:
@@ -1946,18 +2022,28 @@ async def _run_with_health():
         # Application.initialize() does not invoke post_init on this manual
         # start path (only run_polling does), so call it ourselves.
         await _post_init(app)
+
+        # Refuse to become a second poller (the cause of Conflict errors).
+        if not await _claim_polling_lock():
+            log.error("Staying up to serve /health, but NOT polling Telegram.")
+            while True:
+                await asyncio.sleep(3600)
+
+        app.bot_data["lock_task"] = asyncio.create_task(_lock_heartbeat())
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES,
                                           drop_pending_updates=True)
         log.info("Bot + health running…")
-        while True:
-            await asyncio.sleep(3600)
+        await stopping.wait()
     finally:
-        t = app.bot_data.get("wipe_task")
-        if t:
-            t.cancel()
-            try: await t
-            except (asyncio.CancelledError, Exception): pass
+        for key in ("wipe_task", "lock_task"):
+            t = app.bot_data.get(key)
+            if t:
+                t.cancel()
+                try: await t
+                except (asyncio.CancelledError, Exception): pass
+        try: await db.release_instance_lock(INSTANCE_ID)
+        except Exception: pass
         try: await app.updater.stop()
         except: pass
         try: await app.stop()

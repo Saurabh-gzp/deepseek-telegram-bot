@@ -223,6 +223,62 @@ async def global_stats() -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Instance lock
+# --------------------------------------------------------------------------
+
+# Only one process may poll Telegram at a time. Two pollers cause
+# "Conflict: terminated by other getUpdates request" and updates get split
+# randomly between them. This lease lets a new deploy take over cleanly while
+# blocking accidental duplicates (e.g. a local run against the live token).
+LOCK_TTL = 45          # a holder must refresh within this many seconds
+LOCK_REFRESH = 20      # how often the holder refreshes
+
+
+async def acquire_instance_lock(instance_id: str, force: bool = False) -> bool:
+    """Claim the polling lease. True if we own it."""
+    now = _now()
+    cutoff = now - LOCK_TTL
+    q = {"_id": "poller"}
+    if not force:
+        # take it only if nobody holds it, it's stale, or it's already ours
+        q = {"_id": "poller", "$or": [
+            {"heartbeat": {"$lt": cutoff}},
+            {"owner": instance_id},
+        ]}
+    try:
+        res = await _db.locks.find_one_and_update(
+            q,
+            {"$set": {"owner": instance_id, "heartbeat": now,
+                      "since": now}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return bool(res) and res.get("owner") == instance_id
+    except DuplicateKeyError:
+        # someone else inserted first — check whether their lease is stale
+        cur = await _db.locks.find_one({"_id": "poller"})
+        if cur and cur.get("heartbeat", 0) < cutoff:
+            return await acquire_instance_lock(instance_id, force=True)
+        return False
+
+
+async def refresh_instance_lock(instance_id: str) -> bool:
+    """Heartbeat. False means we lost the lease and must stop polling."""
+    res = await _db.locks.update_one(
+        {"_id": "poller", "owner": instance_id},
+        {"$set": {"heartbeat": _now()}})
+    return res.matched_count > 0
+
+
+async def release_instance_lock(instance_id: str) -> None:
+    await _db.locks.delete_one({"_id": "poller", "owner": instance_id})
+
+
+async def instance_lock_holder() -> Optional[Dict[str, Any]]:
+    return await _db.locks.find_one({"_id": "poller"})
+
+
+# --------------------------------------------------------------------------
 # Invites
 # --------------------------------------------------------------------------
 

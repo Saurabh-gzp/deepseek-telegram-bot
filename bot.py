@@ -43,6 +43,7 @@ from telegram.ext import (
 from deepseek_client import DeepSeekClient, RULES
 from md2tg import md_to_tg_html, strip_incomplete_markers, safe_for_telegram
 from personas import PERSONAS, get_persona, wrap_prompt
+from progress import Progress, Waiter
 from urlfetch import extract_urls, is_youtube, fetch_url_text, fetch_youtube_transcript
 
 # ---------- Config ----------
@@ -428,27 +429,33 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         hist = HISTORY.get(q.from_user.id, [])
         if not hist:
             await q.answer("No history yet", show_alert=True); return
-        content = "# DeepSeek Chat Export\n\n"
-        for h in hist:
-            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h['ts']))
-            role = "👤 You" if h['role'] == 'user' else "🤖 Bot"
-            content += f"### {role} — {ts}\n\n{h['text']}\n\n---\n\n"
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".md",
-                                          encoding="utf-8") as f:
-            f.write(content); path = f.name
-        try:
-            with open(path, "rb") as fh:
-                await ctx.bot.send_document(chat_id=q.message.chat_id, document=fh,
-                    filename=f"chat_export_{int(time.time())}.md",
-                    caption=f"📤 Exported {len(hist)} messages")
-        finally:
-            try: os.unlink(path)
-            except: pass
+        async with Progress(ctx.bot, q.message.chat_id, "📤 Chat export",
+                            steps=["Markdown banana", "File bhejna"]) as p:
+            await p.step(0, f"{len(hist)} messages")
+            content = "# DeepSeek Chat Export\n\n"
+            for h in hist:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h['ts']))
+                role = "👤 You" if h['role'] == 'user' else "🤖 Bot"
+                content += f"### {role} — {ts}\n\n{h['text']}\n\n---\n\n"
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".md",
+                                              encoding="utf-8") as f:
+                f.write(content); path = f.name
+            try:
+                await p.step(1, f"{len(content):,} chars")
+                with open(path, "rb") as fh:
+                    await ctx.bot.send_document(
+                        chat_id=q.message.chat_id, document=fh,
+                        filename=f"chat_export_{int(time.time())}.md",
+                        caption=f"📤 Exported {len(hist)} messages")
+            finally:
+                try: os.unlink(path)
+                except: pass
         return
 
     # --- chats list ---
     if data.startswith("chats:"):
         page = int(data.split(":", 1)[1])
+        await q.answer("Loading…")
         chats = await asyncio.to_thread(ds.list_chats)
         ctx.user_data['chat_list'] = chats
         if not chats:
@@ -533,8 +540,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not last or not last.get('raw_answer'):
             await q.answer("No response cached", show_alert=True); return
         await q.answer("Sending file…")
-        await _send_response_file(ctx, q.message.chat_id,
-                                   last.get('prompt', ''), last['raw_answer'])
+        async with Progress(ctx.bot, q.message.chat_id, "📄 File bana raha hoon",
+                            steps=["Markdown banana", "Bhejna"]) as p:
+            await p.step(0, f"{len(last['raw_answer']):,} chars")
+            await p.step(1)
+            await _send_response_file(ctx, q.message.chat_id,
+                                       last.get('prompt', ''), last['raw_answer'])
         return
 
     if data == "rsp:regen":
@@ -593,37 +604,55 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     voice = msg.voice or msg.audio
     if not voice: return
 
-    status = await msg.reply_text("🎤 Sun raha hoon…")
-
-    tg_file = await ctx.bot.get_file(voice.file_id)
     if msg.voice:
         suffix = ".ogg"
     else:
         mt = getattr(voice, 'mime_type', '') or ''
         suffix = "." + (mt.split('/')[-1] or 'mp3')
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp_path = tmp.name
-    try:
-        await tg_file.download_to_drive(tmp_path)
-        from stt import transcribe
-        text, lang = await asyncio.to_thread(transcribe, tmp_path)
-    except Exception as e:
-        log.exception("STT failed")
-        await status.edit_text(f"❌ STT failed: {html.escape(str(e))}",
-                                parse_mode="HTML")
-        return
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
+    dur = getattr(voice, 'duration', 0) or 0
+    tmp_path = None
+    text = lang = None
 
-    if not text:
-        await status.edit_text("🎤 Couldn't detect speech. Try again clearly.")
-        return
+    async with Progress(
+        ctx.bot, update.effective_chat.id, "🎤 Voice message",
+        steps=["Audio download", "Whisper transcribe", "DeepSeek ko bhejna"],
+        reply_to=msg.message_id,
+    ) as p:
+        try:
+            await p.step(0, f"{dur}s audio" if dur else "")
+            tg_file = await ctx.bot.get_file(voice.file_id)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp_path = tmp.name
+            await tg_file.download_to_drive(tmp_path)
 
-    await status.edit_text(
-        f"🗣 <b>You said</b> <i>({lang})</i>:\n{html.escape(text)}",
-        parse_mode="HTML")
+            await p.step(1, f"Whisper '{os.getenv('WHISPER_SIZE', 'small')}' "
+                            f"model — pehli baar model download hoga (~500MB)")
+            from stt import transcribe
+            text, lang = await asyncio.to_thread(transcribe, tmp_path)
+        except Exception as e:
+            log.exception("STT failed")
+            await p.done(f"❌ <b>Voice samajh nahi aayi</b>\n\n"
+                         f"{html.escape(str(e))[:300]}\n\n"
+                         f"<i>💡 faster-whisper install hai? "
+                         f"requirements.txt check karo.</i>")
+            return
+        finally:
+            if tmp_path:
+                try: os.unlink(tmp_path)
+                except: pass
+
+        if not text or not text.strip():
+            await p.done("🎤 <b>Koi speech detect nahi hui.</b>\n\n"
+                         "<i>Saaf bolo, background noise kam karo, "
+                         "aur 1 second se lamba bolo.</i>")
+            return
+
+        await p.step(2, text[:80])
+
+    # transcript stays as a permanent record; the bar is gone
+    await msg.reply_html(
+        f"🗣 <b>You said</b> <i>({lang})</i>:\n{html.escape(text)}")
     await _process_prompt_chat(
         ctx=ctx, chat_id=update.effective_chat.id, user_id=update.effective_user.id,
         prompt=text, reply_to_msg_id=msg.message_id,
@@ -651,55 +680,64 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     file_name = getattr(doc, 'file_name', None) or f"photo_{doc.file_unique_id}.jpg"
     caption = (msg.caption or "").strip()
-    status = await msg.reply_text(f"⏳ Uploading '{html.escape(file_name)}'…",
-                                    parse_mode="HTML")
+    is_photo = bool(msg.photo)
+    size_mb = (getattr(doc, 'file_size', 0) or 0) / 1_048_576
 
-    tg_file = await ctx.bot.get_file(doc.file_id)
-    with tempfile.NamedTemporaryFile(delete=False, suffix="_" + file_name) as tmp:
-        tmp_path = tmp.name
-    try:
-        await tg_file.download_to_drive(tmp_path)
-        await status.edit_text(
-            f"⏳ Uploading '{html.escape(file_name)}'…\n"
-            f"<i>Parse ho raha hai, thoda ruko…</i>", parse_mode="HTML")
-        fid, fname, err = await asyncio.to_thread(ds.upload_file_ex, tmp_path)
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
+    tmp_path = None
+    fid = fname = err = None
 
-    if not fid:
-        is_photo = bool(msg.photo)
-        tip = (
-            "\n\n<b>💡 Photo bhejne ke liye:</b>\n"
-            "• DeepSeek photo ko <b>sirf OCR</b> karta hai — usme saaf "
-            "padhne layak <b>text</b> hona chahiye\n"
-            "• Screenshot, document scan, notes, bill — ye chalega ✅\n"
-            "• Selfie, scenery, meme, logo — ye nahi chalega ❌\n"
-            "• Photo ko <b>Document/File</b> ki tarah bhejo (compress mat "
-            "hone do) — quality better rehti hai"
-        ) if is_photo else (
-            "\n\n<i>💡 txt / pdf / docx / csv best chalte hain. "
-            "Scanned PDF me text layer hona chahiye.</i>"
-        )
-        await status.edit_text(
-            f"❌ <b>Upload nahi ho paaya</b>\n\n"
-            f"{html.escape(err or 'Unknown error')}{tip}",
-            parse_mode="HTML")
-        return
+    async with Progress(
+        ctx.bot, update.effective_chat.id,
+        f"📤 {'Photo' if is_photo else 'File'}: {file_name[:40]}",
+        steps=["Telegram se download", "DeepSeek pe upload", "Parse / OCR"],
+        reply_to=msg.message_id,
+    ) as p:
+        try:
+            await p.step(0, f"{size_mb:.1f} MB" if size_mb else "")
+            tg_file = await ctx.bot.get_file(doc.file_id)
+            with tempfile.NamedTemporaryFile(delete=False,
+                                             suffix="_" + file_name) as tmp:
+                tmp_path = tmp.name
+            await tg_file.download_to_drive(tmp_path)
+
+            await p.step(1, "DeepSeek server pe bhej raha hoon")
+            await p.step(2, "OCR / text extraction chal raha hai"
+                            if is_photo else "Document parse ho raha hai")
+            fid, fname, err = await asyncio.to_thread(ds.upload_file_ex, tmp_path)
+        finally:
+            if tmp_path:
+                try: os.unlink(tmp_path)
+                except: pass
+
+        if not fid:
+            tip = (
+                "\n\n<b>💡 Photo bhejne ke liye:</b>\n"
+                "• DeepSeek photo ko <b>sirf OCR</b> karta hai — usme saaf "
+                "padhne layak <b>text</b> hona chahiye\n"
+                "• Screenshot, document scan, notes, bill — ye chalega ✅\n"
+                "• Selfie, scenery, meme, logo — ye nahi chalega ❌\n"
+                "• Photo ko <b>Document/File</b> ki tarah bhejo (compress mat "
+                "hone do) — quality better rehti hai"
+            ) if is_photo else (
+                "\n\n<i>💡 txt / pdf / docx / csv best chalte hain. "
+                "Scanned PDF me text layer hona chahiye.</i>"
+            )
+            # keep the failure visible instead of deleting the bar
+            await p.done(f"❌ <b>Upload nahi ho paaya</b>\n\n"
+                         f"{html.escape(err or 'Unknown error')}{tip}")
+            return
+        # success → bar auto-deletes on context exit
 
     s.attached_files.append([fid, fname]); save_state()
 
     if caption:
-        await status.edit_text(
-            f"✅ Attached '{html.escape(fname)}'. Processing…", parse_mode="HTML")
         await _process_prompt_chat(
             ctx=ctx, chat_id=update.effective_chat.id, user_id=update.effective_user.id,
             prompt=caption, reply_to_msg_id=msg.message_id,
         )
     else:
-        await status.edit_text(
-            f"✅ Attached: <b>{html.escape(fname)}</b>\nAb sawaal likho.",
-            parse_mode="HTML")
+        await msg.reply_html(
+            f"✅ Attached: <b>{html.escape(fname)}</b>\nAb sawaal likho.")
 
 
 # ---------- Text ----------
@@ -726,51 +764,65 @@ async def _try_url_summarize(ctx, update, url: str, original_text: str) -> bool:
     """Fetch URL/YT, then feed content to DeepSeek. Returns True if handled."""
     msg = update.message
     yt_id = is_youtube(url)
-    status = await msg.reply_text(
-        f"🔗 Fetching {'YouTube' if yt_id else 'page'}…")
-    try:
-        if yt_id:
-            text, _ = await asyncio.to_thread(fetch_youtube_transcript, yt_id)
-            source_desc = f"YouTube video: {url}"
-        else:
-            text, title = await asyncio.to_thread(fetch_url_text, url)
-            source_desc = f"URL: {url}" + (f"\nTitle: {title}" if title else "")
+    kind = "YouTube" if yt_id else "Web page"
+    prompt = None
 
-        if not text or len(text) < 50:
-            await status.edit_text(f"❌ Couldn't extract useful content from {url}")
+    async with Progress(
+        ctx.bot, update.effective_chat.id, f"🔗 {kind} padh raha hoon",
+        steps=([f"Transcript nikalna", "Text saaf karna", "DeepSeek ko bhejna"]
+               if yt_id else
+               ["Page download", "Article extract", "DeepSeek ko bhejna"]),
+        reply_to=msg.message_id,
+    ) as p:
+        try:
+            await p.step(0, url[:70])
+            if yt_id:
+                text, _ = await asyncio.to_thread(fetch_youtube_transcript, yt_id)
+                source_desc = f"YouTube video: {url}"
+            else:
+                text, title = await asyncio.to_thread(fetch_url_text, url)
+                source_desc = f"URL: {url}" + (f"\nTitle: {title}" if title else "")
+
+            if not text or len(text) < 50:
+                await p.done(
+                    f"❌ <b>Content nahi mila</b>\n\n"
+                    f"{html.escape(url[:100])}\n\n"
+                    + ("<i>💡 Is video pe transcript/captions off hain, "
+                       "ya video private hai.</i>" if yt_id else
+                       "<i>💡 Page JavaScript se load hota hai ya login "
+                       "maangta hai — bot uska text nahi padh sakta.</i>"))
+                return False
+
+            await p.step(1, f"{len(text):,} characters mile")
+            if len(text) > URL_TEXT_CAP:
+                text = text[:URL_TEXT_CAP] + "\n\n[…truncated]"
+                await p.note(f"{URL_TEXT_CAP:,} chars tak trim kiya")
+
+            user_intent = original_text.replace(url, "").strip()
+            if not user_intent or user_intent.lower() in {"summarize", "summary", "sum"}:
+                instruction = "Summarize the content clearly with key points."
+            else:
+                instruction = user_intent
+
+            prompt = (
+                f"[Content from {source_desc}]:\n\n"
+                f"{text}\n\n"
+                f"---\n\n{instruction}"
+            )
+            await p.step(2, instruction[:70])
+        except Exception as e:
+            log.warning("URL fetch failed: %s", e)
+            await p.done(
+                f"⚠️ <b>{kind} fetch fail hui</b>\n\n"
+                f"{html.escape(str(e))[:250]}\n\n"
+                f"<i>Message ko normal sawaal ki tarah bhej raha hoon…</i>")
             return False
 
-        if len(text) > URL_TEXT_CAP:
-            text = text[:URL_TEXT_CAP] + "\n\n[…truncated]"
-
-        await status.edit_text(
-            f"✅ Fetched {len(text):,} chars. Asking DeepSeek…")
-
-        # Build a good prompt
-        user_intent = original_text.replace(url, "").strip()
-        if not user_intent or user_intent.lower() in {"summarize", "summary", "sum"}:
-            instruction = "Summarize the content clearly with key points."
-        else:
-            instruction = user_intent
-
-        prompt = (
-            f"[Content from {source_desc}]:\n\n"
-            f"{text}\n\n"
-            f"---\n\n{instruction}"
-        )
-        await _process_prompt_chat(
-            ctx=ctx, chat_id=update.effective_chat.id, user_id=update.effective_user.id,
-            prompt=prompt, reply_to_msg_id=msg.message_id,
-        )
-        return True
-    except Exception as e:
-        log.warning("URL fetch failed: %s", e)
-        try:
-            await status.edit_text(
-                f"⚠️ Couldn't fetch URL ({html.escape(str(e))}). "
-                "Processing message as-is…", parse_mode="HTML")
-        except: pass
-        return False
+    await _process_prompt_chat(
+        ctx=ctx, chat_id=update.effective_chat.id, user_id=update.effective_user.id,
+        prompt=prompt, reply_to_msg_id=msg.message_id,
+    )
+    return True
 
 
 # ---------- Send helpers ----------
@@ -779,16 +831,29 @@ async def _send_tts(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
     from tts import synthesize_ogg
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
         ogg_path = f.name
-    try:
-        await synthesize_ogg(text, ogg_path, prefer_female=female)
-        with open(ogg_path, "rb") as fh:
-            await ctx.bot.send_voice(chat_id=chat_id, voice=fh)
-    except Exception as e:
-        log.exception("TTS failed")
-        await ctx.bot.send_message(chat_id=chat_id, text=f"❌ TTS failed: {e}")
-    finally:
-        try: os.unlink(ogg_path)
-        except: pass
+
+    n_chars = len(text)
+    async with Progress(
+        ctx.bot, chat_id, "🔊 Voice bana raha hoon",
+        steps=["Text saaf karna", "Awaaz generate", "Telegram pe bhejna"],
+    ) as p:
+        try:
+            await p.step(0, f"{n_chars:,} characters")
+            await p.step(1, f"{'♀ Female' if female else '♂ Male'} voice "
+                            f"· edge-tts")
+            await synthesize_ogg(text, ogg_path, prefer_female=female)
+
+            await p.step(2)
+            with open(ogg_path, "rb") as fh:
+                await ctx.bot.send_voice(chat_id=chat_id, voice=fh)
+            # bar deletes itself here; the voice note is the result
+        except Exception as e:
+            log.exception("TTS failed")
+            await p.done(f"❌ <b>Voice nahi ban paayi</b>\n\n"
+                         f"{html.escape(str(e))[:300]}")
+        finally:
+            try: os.unlink(ogg_path)
+            except: pass
 
 
 async def _send_response_file(ctx, chat_id: int, prompt: str, answer: str):
@@ -853,6 +918,13 @@ async def _process_prompt_chat(*, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
         chat_id=chat_id, text="⏳ …",
         reply_to_message_id=reply_to_msg_id,
     )
+    # Animated bar while we wait for DeepSeek's first token. It edits the
+    # placeholder in-place, so the answer simply overwrites it — nothing to
+    # clean up and no extra message in the chat.
+    waiter = Waiter(placeholder,
+                    "Files parse ho rahi hain, DeepSeek soch raha hai"
+                    if file_ids else "DeepSeek soch raha hai")
+    await waiter.start()
 
     think_buf = ""
     answer_started = False
@@ -895,6 +967,10 @@ async def _process_prompt_chat(*, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
     try:
         got_any = False
         async for ev in stream_iter():
+            if not got_any:
+                # first event from DeepSeek → stop the waiting animation so it
+                # can't overwrite the streaming answer
+                await waiter.stop()
             got_any = True
             if ev['type'] == 'msg_id':
                 s.parent_msg_id = ev['id']; continue
@@ -943,7 +1019,11 @@ async def _process_prompt_chat(*, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                 await safe_edit(messages[-1], txt)
 
         if not got_any:
-            await safe_edit(messages[-1], "❌ No response from DeepSeek.",
+            await waiter.stop()
+            await safe_edit(messages[-1],
+                             "❌ <b>DeepSeek se koi jawab nahi aaya.</b>\n\n"
+                             "<i>💡 Token expire ho sakta hai, ya DeepSeek "
+                             "server busy hai. 'New Chat' try karo.</i>",
                              kb=response_footer_kb(has_text=False))
             return
 
@@ -997,6 +1077,9 @@ async def _process_prompt_chat(*, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
             await safe_edit(messages[-1], f"❌ Error: {html.escape(str(e))}",
                              kb=response_footer_kb(has_text=False))
         except: pass
+    finally:
+        # guarantee the animator never outlives the request
+        await waiter.stop()
 
 
 # ---------- Post-init ----------

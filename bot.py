@@ -23,17 +23,16 @@ New features:
 """
 import asyncio
 import html
-import json
 import logging
 import os
 import re
 import tempfile
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      BotCommand, LinkPreviewOptions)
+                      BotCommand, BotCommandScopeChat, LinkPreviewOptions)
 from telegram.error import BadRequest, Conflict, NetworkError, TimedOut
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -46,27 +45,33 @@ from personas import PERSONAS, get_persona, wrap_prompt
 from progress import Progress, Waiter
 from urlfetch import extract_urls, is_youtube, fetch_url_text, fetch_youtube_transcript
 
+import admin as adm
+import db
+from scheduler import nightly_wipe_loop
+from token_pool import POOL
+
 # ---------- Config ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DEEPSEEK_TOKEN = os.getenv("DEEPSEEK_TOKEN")
+DEEPSEEK_TOKEN = os.getenv("DEEPSEEK_TOKEN")   # optional: seeds the key pool
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
 WORKDIR = os.path.dirname(os.path.abspath(__file__))
 ENABLE_HEALTH = os.getenv("ENABLE_HEALTH", "0") == "1"
 
-if not TELEGRAM_TOKEN or not DEEPSEEK_TOKEN or not OWNER_ID:
+if not TELEGRAM_TOKEN or not OWNER_ID:
     raise SystemExit(
         "❌ Missing required env vars.\n"
-        "Set TELEGRAM_TOKEN, DEEPSEEK_TOKEN, and OWNER_ID.\n"
+        "Set TELEGRAM_TOKEN and OWNER_ID (DeepSeek keys are managed from the\n"
+        "in-bot admin panel, or seed one with DEEPSEEK_TOKEN).\n"
         "Copy .env.example → .env and fill in the values, or set them in "
         "your host's dashboard (Render / Railway / etc.)."
     )
 
-CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
-HISTORY_FILE = os.getenv("HISTORY_FILE", "history.json")
+CONCURRENCY = int(os.getenv("CONCURRENCY", "16"))
 # Max DeepSeek requests per user inside RATE_WINDOW seconds (0 disables)
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "20"))
 RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))
+# How long a user waits for a free DeepSeek key before being told to retry
+KEY_WAIT_TIMEOUT = float(os.getenv("KEY_WAIT_TIMEOUT", "180"))
 
 MAX_TG_MSG = 3800
 FILE_THRESHOLD = 10000
@@ -80,17 +85,17 @@ logging.basicConfig(
 log = logging.getLogger("dsbot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-ds = DeepSeekClient(DEEPSEEK_TOKEN, workdir=WORKDIR)
-
 # In-memory response cache per user (for regenerate/tts/file/quick actions)
 LAST: Dict[int, dict] = {}
 # Cooperative cancellation: user ids that pressed /cancel or the Stop button
 CANCELLED: set = set()
 # Sliding window of request timestamps per user, for rate limiting
 _RATE: Dict[int, List[float]] = {}
-# Chat history (last N exchanges) per user for /export
-HISTORY: Dict[int, List[dict]] = {}
 MAX_HISTORY = 100
+# Admins waiting to type something (broadcast text, a key, a DM)
+PENDING_INPUT: Dict[int, dict] = {}
+# Users we already pinged the owner about (avoid repeat spam)
+PENDING_NOTIFIED: Dict[int, bool] = {}
 
 
 # ---------- State ----------
@@ -110,7 +115,10 @@ class UserState:
     total_chars_in: int = 0
     total_chars_out: int = 0
 
+# Write-through cache: uid -> UserState mirrored in MongoDB.
 STATE: Dict[int, UserState] = {}
+# Cached user documents (status/role) so hot paths avoid a round-trip.
+USERS: Dict[int, dict] = {}
 
 # One lock per user. With concurrent_updates>1 two messages could otherwise
 # interleave and corrupt parent_msg_id (DeepSeek's conversation pointer).
@@ -122,78 +130,90 @@ def user_lock(uid: int) -> asyncio.Lock:
         lk = _LOCKS[uid] = asyncio.Lock()
     return lk
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                raw = json.load(f)
-            for k, v in raw.items():
-                v = {kk: vv for kk, vv in v.items()
-                     if kk in UserState.__dataclass_fields__}
-                STATE[int(k)] = UserState(**v)
-            log.info("Loaded state for %d user(s)", len(STATE))
-        except Exception as e:
-            log.warning("state load failed: %s", e)
-    load_history()
+
+def _state_from_doc(doc: dict) -> UserState:
+    st = UserState()
+    for k, v in (doc.get("settings") or {}).items():
+        if hasattr(st, k):
+            setattr(st, k, v)
+    st.session_id = doc.get("session_id")
+    st.parent_msg_id = doc.get("parent_msg_id")
+    st.attached_files = doc.get("attached_files") or []
+    st.msg_count = doc.get("msg_count", 0)
+    st.total_chars_in = doc.get("chars_in", 0)
+    st.total_chars_out = doc.get("chars_out", 0)
+    return st
 
 
-def load_history():
-    """Restore chat history so /export and Regen survive a restart."""
-    if not os.path.exists(HISTORY_FILE):
+async def load_user(uid: int, *, username: str = "",
+                    first_name: str = "") -> dict:
+    """Fetch (or create) the Mongo user doc and hydrate the local caches."""
+    doc = await db.upsert_user(uid, username=username, first_name=first_name)
+    USERS[uid] = doc
+    STATE[uid] = _state_from_doc(doc)
+    return doc
+
+
+async def save_settings(uid: int) -> None:
+    """Persist the toggle/persona block for one user."""
+    st = STATE.get(uid)
+    if not st:
         return
-    try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            raw = json.load(f)
-        for k, v in raw.items():
-            if isinstance(v, list):
-                HISTORY[int(k)] = v[-MAX_HISTORY:]
-        log.info("Loaded history for %d user(s)", len(HISTORY))
-    except Exception as e:
-        log.warning("history load failed: %s", e)
+    await db.set_user_field(uid, settings={
+        "model_type": st.model_type, "thinking": st.thinking,
+        "search": st.search, "voice_reply": st.voice_reply,
+        "tts_female": st.tts_female, "auto_urls": st.auto_urls,
+        "persona": st.persona,
+    })
 
 
-def save_history():
-    """Atomic write, same approach as save_state()."""
-    try:
-        d = os.path.dirname(os.path.abspath(HISTORY_FILE)) or "."
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".hist-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({str(k): v for k, v in HISTORY.items()}, f,
-                          ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, HISTORY_FILE)
-        except Exception:
-            try: os.unlink(tmp)
-            except: pass
-            raise
-    except Exception as e:
-        log.warning("history save failed: %s", e)
+async def save_session(uid: int) -> None:
+    """Persist the DeepSeek conversation pointer for one user."""
+    st = STATE.get(uid)
+    if not st:
+        return
+    await db.set_user_field(uid, session_id=st.session_id,
+                            parent_msg_id=st.parent_msg_id,
+                            attached_files=st.attached_files)
 
-def save_state():
-    """Atomic write — a crash mid-save can no longer corrupt state.json."""
-    try:
-        data = {str(k): asdict(v) for k, v in STATE.items()}
-        d = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".state-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, STATE_FILE)      # atomic on POSIX
-        except Exception:
-            try: os.unlink(tmp)
-            except: pass
-            raise
-    except Exception as e:
-        log.warning("state save failed: %s", e)
 
 def get_state(uid: int) -> UserState:
     if uid not in STATE:
         STATE[uid] = UserState()
     return STATE[uid]
+
+
+async def ds_op(uid: int, method: str, *args, timeout: float = 60.0):
+    """
+    Run a short DeepSeek call on a pooled key.
+
+    The key is held only for the duration of the call, so quick operations
+    (create/list/delete/upload) never block a long-running chat stream for
+    longer than necessary. Returns None when no key is available.
+    """
+    async with POOL.acquire(uid, timeout=timeout) as lease:
+        if lease is None:
+            return None
+        try:
+            return await asyncio.to_thread(getattr(lease.client, method), *args)
+        except Exception as e:
+            log.warning("DeepSeek %s failed on key %s: %s",
+                        method, lease.label, e)
+            await db.mark_token(lease.label, healthy=True, error=str(e))
+            return None
+
+
+def user_status(uid: int) -> str:
+    if uid == OWNER_ID:
+        return db.ACTIVE
+    return (USERS.get(uid) or {}).get("status", db.PENDING)
+
+
+def is_admin(uid: int) -> bool:
+    if uid == OWNER_ID:
+        return True
+    return (USERS.get(uid) or {}).get("role") == "admin"
+
 
 def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
@@ -223,7 +243,7 @@ def status_text(s: UserState) -> str:
     return "\n".join(lines)
 
 
-def main_menu_kb(s: UserState) -> InlineKeyboardMarkup:
+def main_menu_kb(s: UserState, uid: int = 0) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(f"{'🟢' if s.model_type=='default' else '⚪'} Instant",
                               callback_data="mode:default"),
@@ -256,6 +276,9 @@ def main_menu_kb(s: UserState) -> InlineKeyboardMarkup:
         InlineKeyboardButton("❓ Help", callback_data="cmd:help"),
         InlineKeyboardButton("🔄 Refresh", callback_data="cmd:refresh"),
     ])
+    if is_admin(uid):
+        rows.append([InlineKeyboardButton("🛠 Admin panel",
+                                          callback_data="adm:menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -284,7 +307,7 @@ def response_footer_kb(has_text: bool = True) -> InlineKeyboardMarkup:
             InlineKeyboardButton("⚡ Quick actions", callback_data="rsp:actions"),
         ])
     rows.append([
-        InlineKeyboardButton("🆕 New", callback_data="cmd:new"),
+        InlineKeyboardButton("🆕 New Chat", callback_data="cmd:new"),
         InlineKeyboardButton("🏠 Menu", callback_data="cmd:refresh"),
         InlineKeyboardButton("❓ Help", callback_data="cmd:help"),
     ])
@@ -349,6 +372,9 @@ HELP_TEXT = (
 "<b>Long responses:</b>\n"
 "3800–10000 chars → multi-bubble\n"
 "10000+ → auto .md file\n\n"
+"<b>Privacy:</b>\n"
+"Your chats are private — no other user can see them.\n"
+"All conversations are deleted automatically every night.\n\n"
 "<b>Slash commands:</b>\n"
 "/start — menu\n/help — this page\n/cancel — stop the running task\n\n"
 "<i>💡 Tip: just type normally — input type is detected automatically.</i>"
@@ -356,9 +382,9 @@ HELP_TEXT = (
 
 
 # ---------- Utility ----------
-async def send_menu(target, s: UserState, edit: bool = False):
+async def send_menu(target, s: UserState, edit: bool = False, uid: int = 0):
     text = status_text(s)
-    kb = main_menu_kb(s)
+    kb = main_menu_kb(s, uid)
     try:
         if edit:
             await target.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
@@ -377,12 +403,12 @@ def _ticker_view(think_buf: str) -> str:
     return f"🤔 <i>{html.escape(tail) if tail else '…'}</i> ▍"
 
 
-def record_history(uid: int, role: str, text: str):
-    lst = HISTORY.setdefault(uid, [])
-    lst.append({"role": role, "text": text, "ts": time.time()})
-    if len(lst) > MAX_HISTORY:
-        del lst[:len(lst) - MAX_HISTORY]
-    save_history()
+async def record_history(uid: int, role: str, text: str):
+    """Store one turn. Rows carry a 24h TTL and are wiped nightly."""
+    try:
+        await db.add_turn(uid, role, text)
+    except Exception as e:
+        log.warning("history write failed: %s", e)
 
 
 # ---------- Rate limiting ----------
@@ -407,15 +433,105 @@ def rate_check(uid: int) -> Optional[int]:
 
 
 # ---------- Slash commands ----------
+async def gate(update: Update) -> bool:
+    """
+    Access control for every entry point.
+
+    Loads/creates the user, then decides:
+      • owner/admin  -> always allowed
+      • blocked      -> silently refused
+      • active       -> allowed
+      • pending      -> allowed only when access mode is open, otherwise the
+                        owner gets an approval request
+    Returns True when the update may proceed.
+    """
+    u = update.effective_user
+    if u is None:
+        return False
+    uid = u.id
+    doc = USERS.get(uid)
+    if doc is None:
+        doc = await load_user(uid, username=u.username or "",
+                              first_name=u.first_name or "")
+    else:
+        asyncio.create_task(db.upsert_user(
+            uid, username=u.username or "", first_name=u.first_name or ""))
+
+    if uid == OWNER_ID:
+        if doc.get("status") != db.ACTIVE or doc.get("role") != "admin":
+            await db.set_user_field(uid, status=db.ACTIVE, role="admin")
+            doc["status"], doc["role"] = db.ACTIVE, "admin"
+        return True
+
+    status = doc.get("status", db.PENDING)
+    if status == db.BLOCKED:
+        return False
+    if status == db.ACTIVE:
+        return True
+
+    # pending
+    cfg = await db.get_config()
+    if cfg.get("access_mode") == db.MODE_OPEN:
+        await db.set_user_status(uid, db.ACTIVE)
+        doc["status"] = db.ACTIVE
+        USERS[uid] = doc
+        return True
+
+    await _request_approval(update, u)
+    return False
+
+
+async def _request_approval(update: Update, u) -> None:
+    """Tell the user they need approval and ping the owner once."""
+    try:
+        await update.effective_message.reply_html(
+            "🔒 <b>This bot is invite-only</b>\n\n"
+            "Your request has been sent to the admin. "
+            "You'll get a message here once you're approved.")
+    except Exception:
+        pass
+    if PENDING_NOTIFIED.get(u.id):
+        return
+    PENDING_NOTIFIED[u.id] = True
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"adm:approve:{u.id}"),
+        InlineKeyboardButton("🚫 Block", callback_data=f"adm:block:{u.id}"),
+    ]])
+    try:
+        await update.get_bot().send_message(
+            chat_id=OWNER_ID,
+            text=("👋 <b>New access request</b>\n\n"
+                  f"• Name: {html.escape(u.first_name or '—')}\n"
+                  f"• Username: @{html.escape(u.username or '—')}\n"
+                  f"• ID: <code>{u.id}</code>"),
+            parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        log.warning("approval ping failed: %s", e)
+
+
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Personal bot."); return
-    await send_menu(update, get_state(update.effective_user.id))
+    if not await gate(update):
+        return
+    await send_menu(update, get_state(update.effective_user.id),
+                    uid=update.effective_user.id)
+
+
+async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in USERS:
+        await load_user(uid)
+    if not is_admin(uid):
+        return
+    await update.message.reply_html(await adm.stats_text(),
+                                    reply_markup=adm.admin_menu_kb())
 
 async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Stop whatever DeepSeek request is currently streaming."""
     uid = update.effective_user.id
-    if not is_owner(uid): return
+    if not await gate(update): return
+    if PENDING_INPUT.pop(uid, None):
+        await update.message.reply_text("Cancelled.")
+        return
     if user_lock(uid).locked():
         CANCELLED.add(uid)
         await update.message.reply_text("⏹ Stopping the current request…")
@@ -424,7 +540,7 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id): return
+    if not await gate(update): return
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="cmd:refresh")]])
     await update.message.reply_html(HELP_TEXT, reply_markup=kb)
 
@@ -432,12 +548,22 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- Button handler ----------
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not is_owner(q.from_user.id):
-        if q: await q.answer("Not allowed", show_alert=True)
+    if not q:
+        return
+    if not await gate(update):
+        await q.answer("You don't have access to this bot.", show_alert=True)
         return
     await q.answer()
     data = q.data or ""
     s = get_state(q.from_user.id)
+
+    # --- admin panel (owner/admins only) ---
+    if data.startswith("adm:"):
+        if not is_admin(q.from_user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        await handle_admin(q, ctx, data)
+        return
 
     # --- mode/toggles ---
     if data.startswith("mode:"):
@@ -447,24 +573,24 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             r = RULES[m]
             if not r['supports_search']: s.search = False
             if not r['supports_files']: s.attached_files = []
-            save_state()
-        await send_menu(q, s, edit=True); return
+            await save_settings(q.from_user.id)
+        await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     if data == "toggle:think":
-        s.thinking = not s.thinking; save_state(); await send_menu(q, s, edit=True); return
+        s.thinking = not s.thinking; await save_settings(q.from_user.id); await send_menu(q, s, edit=True, uid=q.from_user.id); return
     if data == "toggle:voice":
-        s.voice_reply = not s.voice_reply; save_state(); await send_menu(q, s, edit=True); return
+        s.voice_reply = not s.voice_reply; await save_settings(q.from_user.id); await send_menu(q, s, edit=True, uid=q.from_user.id); return
     if data == "toggle:gender":
-        s.tts_female = not s.tts_female; save_state(); await send_menu(q, s, edit=True); return
+        s.tts_female = not s.tts_female; await save_settings(q.from_user.id); await send_menu(q, s, edit=True, uid=q.from_user.id); return
     if data == "toggle:urls":
-        s.auto_urls = not s.auto_urls; save_state(); await send_menu(q, s, edit=True); return
+        s.auto_urls = not s.auto_urls; await save_settings(q.from_user.id); await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     if data == "toggle:search":
         if not RULES[s.model_type]['supports_search']:
             await q.answer("Search blocked in this mode", show_alert=True); return
         if s.attached_files:
             await q.answer("Files attached — detach first", show_alert=True); return
-        s.search = not s.search; save_state(); await send_menu(q, s, edit=True); return
+        s.search = not s.search; await save_settings(q.from_user.id); await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     # --- personas ---
     if data.startswith("personas:"):
@@ -478,14 +604,14 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("persona:"):
         key = data.split(":", 1)[1]
         if key in PERSONAS:
-            s.persona = key; save_state()
+            s.persona = key; await save_settings(q.from_user.id)
             await q.answer(f"Persona: {PERSONAS[key]['name']}")
-        await send_menu(q, s, edit=True); return
+        await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     # --- commands ---
     if data in ("cmd:refresh", "cmd:menu"):
-        try: await send_menu(q, s, edit=True)
-        except: await q.message.reply_html(status_text(s), reply_markup=main_menu_kb(s))
+        try: await send_menu(q, s, edit=True, uid=q.from_user.id)
+        except: await q.message.reply_html(status_text(s), reply_markup=main_menu_kb(s, q.from_user.id))
         return
 
     if data == "cmd:help":
@@ -498,17 +624,17 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "cmd:detach":
-        s.attached_files = []; save_state()
-        await q.answer("Detached"); await send_menu(q, s, edit=True); return
+        s.attached_files = []; await save_session(q.from_user.id)
+        await q.answer("Detached"); await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     if data == "cmd:new":
-        sid = await asyncio.to_thread(ds.create_chat)
+        sid = await ds_op(q.from_user.id, 'create_chat')
         if sid:
             s.session_id = sid; s.parent_msg_id = None; s.attached_files = []
-            save_state(); await q.answer("New chat started")
+            await save_session(q.from_user.id); await q.answer("New chat started")
         else: await q.answer("Failed", show_alert=True)
-        try: await send_menu(q, s, edit=True)
-        except: await q.message.reply_html(status_text(s), reply_markup=main_menu_kb(s))
+        try: await send_menu(q, s, edit=True, uid=q.from_user.id)
+        except: await q.message.reply_html(status_text(s), reply_markup=main_menu_kb(s, q.from_user.id))
         return
 
     if data == "cmd:stats":
@@ -519,7 +645,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Chars received: <b>{s.total_chars_out:,}</b>\n"
             f"Persona: <b>{get_persona(s.persona)['name']}</b>\n"
             f"Mode: <b>{RULES[s.model_type]['name']}</b>\n"
-            f"History cached: <b>{len(HISTORY.get(q.from_user.id, []))}</b> msgs"
+            f"Stored turns: <b>{len(await db.get_history(q.from_user.id, limit=500))}</b> "
+            f"<i>(cleared nightly)</i>"
         )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="cmd:refresh")]])
         try: await q.edit_message_text(stats, parse_mode="HTML", reply_markup=kb)
@@ -527,7 +654,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "cmd:export":
-        hist = HISTORY.get(q.from_user.id, [])
+        hist = await db.get_history(q.from_user.id, limit=500)
         if not hist:
             await q.answer("No history yet", show_alert=True); return
         async with Progress(ctx.bot, q.message.chat_id, "📤 Chat export",
@@ -557,7 +684,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("chats:"):
         page = int(data.split(":", 1)[1])
         await q.answer("Loading…")
-        chats = await asyncio.to_thread(ds.list_chats)
+        chats = await ds_op(q.from_user.id, 'list_chats') or []
         ctx.user_data['chat_list'] = chats
         if not chats:
             await q.answer("No chats found", show_alert=True); return
@@ -571,18 +698,19 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("switch:"):
         idx = int(data.split(":", 1)[1])
-        chats = ctx.user_data.get('chat_list') or await asyncio.to_thread(ds.list_chats)
+        chats = ctx.user_data.get('chat_list') or await ds_op(q.from_user.id, 'list_chats') or []
         if idx >= len(chats):
             await q.answer("Out of range", show_alert=True); return
         c = chats[idx]
         s.session_id = c['id']
-        _, last = await asyncio.to_thread(ds.get_history, c['id'])
+        hist = await ds_op(q.from_user.id, 'get_history', c['id'])
+        last = hist[1] if hist else None
         s.parent_msg_id = last
         m = c.get('model_type', 'default')
         if m in RULES: s.model_type = m
-        save_state()
+        await save_session(q.from_user.id); await save_settings(q.from_user.id)
         await q.answer(f"Switched: {(c.get('title') or 'Untitled')[:25]}")
-        await send_menu(q, s, edit=True); return
+        await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     if data == "cmd:delete_ask":
         if not s.session_id:
@@ -600,12 +728,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "cmd:delete_yes":
         if s.session_id:
-            ok = await asyncio.to_thread(ds.delete_chat, s.session_id)
+            ok = await ds_op(q.from_user.id, 'delete_chat', s.session_id)
             if ok:
                 s.session_id = None; s.parent_msg_id = None; s.attached_files = []
-                save_state(); await q.answer("Deleted")
+                await save_session(q.from_user.id); await q.answer("Deleted")
             else: await q.answer("Failed", show_alert=True)
-        await send_menu(q, s, edit=True); return
+        await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     if data == "cmd:wipe_ask":
         kb = InlineKeyboardMarkup([[
@@ -620,12 +748,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "cmd:wipe_yes":
-        ok = await asyncio.to_thread(ds.delete_all_chats)
-        for st in STATE.values():
-            st.session_id = None; st.parent_msg_id = None
-        save_state()
+        ok = await ds_op(q.from_user.id, 'delete_all_chats')
+        s.session_id = None; s.parent_msg_id = None; s.attached_files = []
+        await save_session(q.from_user.id)
+        await db.clear_history(q.from_user.id)
         await q.answer("Wiped" if ok else "Failed", show_alert=True)
-        await send_menu(q, s, edit=True); return
+        await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     # --- Response actions ---
     if data == "rsp:speak":
@@ -655,7 +783,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("Nothing to regenerate", show_alert=True); return
         await q.answer("Regenerating…")
         s.parent_msg_id = last.get('parent_before')
-        save_state()
+        await save_session(q.from_user.id)
         await _process_prompt_chat(
             ctx=ctx, chat_id=q.message.chat_id, user_id=q.from_user.id,
             prompt=last['prompt'], reply_to_msg_id=None, is_regen=True,
@@ -706,9 +834,254 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 
+# ---------- Admin panel ----------
+async def _safe_edit_q(q, text: str, kb=None):
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            try:
+                await q.message.reply_html(text, reply_markup=kb)
+            except Exception:
+                pass
+
+
+async def handle_admin(q, ctx, data: str):
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    admin_id = q.from_user.id
+
+    if action == "menu":
+        await _safe_edit_q(q, await adm.stats_text(), adm.admin_menu_kb())
+        return
+
+    if action == "stats":
+        await _safe_edit_q(q, await adm.stats_text(), adm.admin_menu_kb())
+        return
+
+    # ----- users -----
+    if action == "users":
+        status = parts[2] if len(parts) > 2 else db.ACTIVE
+        page = int(parts[3]) if len(parts) > 3 else 0
+        total = await db.count_users(status)
+        users = await db.list_users(status, skip=page * adm.PAGE,
+                                    limit=adm.PAGE)
+        label = {"active": "Active", "pending": "Pending",
+                 "blocked": "Blocked"}.get(status, status)
+        txt = (f"👥 <b>{label} users</b> — {total} total\n\n"
+               + ("<i>Nobody here yet.</i>" if not users else
+                  "<i>Tap a user to manage them.</i>"))
+        await _safe_edit_q(q, txt, adm.users_kb(users, status, page, total))
+        return
+
+    if action == "u":
+        uid = int(parts[2])
+        txt, st = await adm.user_detail_text(uid)
+        await _safe_edit_q(q, txt, adm.user_detail_kb(uid, st))
+        return
+
+    if action in ("approve", "block"):
+        uid = int(parts[2])
+        new_status = db.ACTIVE if action == "approve" else db.BLOCKED
+        await db.set_user_status(uid, new_status)
+        if uid in USERS:
+            USERS[uid]["status"] = new_status
+        PENDING_NOTIFIED.pop(uid, None)
+        await q.answer("Approved" if action == "approve" else "Blocked")
+        try:
+            await ctx.bot.send_message(
+                chat_id=uid,
+                text=("✅ <b>You're approved!</b>\n\nSend /start to begin."
+                      if action == "approve" else
+                      "🚫 <b>Your access has been revoked.</b>"),
+                parse_mode="HTML")
+        except Exception:
+            pass
+        txt, st = await adm.user_detail_text(uid)
+        await _safe_edit_q(q, txt, adm.user_detail_kb(uid, st))
+        return
+
+    if action == "chat":
+        uid = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 else 0
+        txt, more = await adm.user_chat_text(uid, page)
+        rows = []
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                "⬅️", callback_data=f"adm:chat:{uid}:{page-1}"))
+        if more:
+            nav.append(InlineKeyboardButton(
+                "➡️", callback_data=f"adm:chat:{uid}:{page+1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("🔙 User",
+                                          callback_data=f"adm:u:{uid}")])
+        await _safe_edit_q(q, txt, InlineKeyboardMarkup(rows))
+        return
+
+    if action == "clear":
+        uid = int(parts[2])
+        n = await db.clear_history(uid)
+        await q.answer(f"Cleared {n} turns")
+        txt, st = await adm.user_detail_text(uid)
+        await _safe_edit_q(q, txt, adm.user_detail_kb(uid, st))
+        return
+
+    if action == "dm":
+        uid = int(parts[2])
+        PENDING_INPUT[admin_id] = {"kind": "dm", "target": uid}
+        await _safe_edit_q(
+            q, f"✉️ <b>Send the message for user <code>{uid}</code></b>\n\n"
+               "<i>Type it now, or /cancel to abort.</i>")
+        return
+
+    # ----- access mode -----
+    if action == "mode":
+        cfg = await db.get_config()
+        cur = cfg.get("access_mode", db.MODE_INVITE)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                ("🔒 " if cur == db.MODE_INVITE else "") + "Invite only",
+                callback_data="adm:setmode:invite")],
+            [InlineKeyboardButton(
+                ("🌍 " if cur == db.MODE_OPEN else "") + "Open to everyone",
+                callback_data="adm:setmode:open")],
+            [InlineKeyboardButton("🔙 Admin menu", callback_data="adm:menu")],
+        ])
+        await _safe_edit_q(
+            q,
+            "🚪 <b>Access mode</b>\n\n"
+            "🔒 <b>Invite only</b> — new people wait for your approval.\n"
+            "🌍 <b>Open</b> — anyone who presses /start gets in immediately.\n\n"
+            f"Currently: <b>{'Invite only' if cur == db.MODE_INVITE else 'Open'}</b>",
+            kb)
+        return
+
+    if action == "setmode":
+        mode = db.MODE_OPEN if parts[2] == "open" else db.MODE_INVITE
+        await db.set_config(access_mode=mode)
+        await q.answer("Access mode updated")
+        await _safe_edit_q(q, await adm.stats_text(), adm.admin_menu_kb())
+        return
+
+    # ----- keys -----
+    if action == "keys":
+        await _safe_edit_q(q, await adm.keys_text(),
+                           adm.keys_kb(await db.list_tokens()))
+        return
+
+    if action == "key":
+        which = parts[2] if len(parts) > 2 else ""
+        if which == "add":
+            PENDING_INPUT[admin_id] = {"kind": "addkey"}
+            await _safe_edit_q(
+                q,
+                "🔑 <b>Add a DeepSeek key</b>\n\n"
+                "Send it as:\n<code>label = token</code>\n\n"
+                "Example:\n<code>acct2 = abc123...</code>\n\n"
+                "<i>Each key adds one more simultaneous user. "
+                "/cancel to abort.</i>")
+            return
+        label = ":".join(parts[2:])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Remove this key",
+                                  callback_data=f"adm:keydel:{label}")],
+            [InlineKeyboardButton("🔙 Keys", callback_data="adm:keys")],
+        ])
+        await _safe_edit_q(q, f"🔑 <b>{html.escape(label)}</b>\n\n"
+                              "<i>Removing a key reduces how many people can "
+                              "chat at the same time.</i>", kb)
+        return
+
+    if action == "keydel":
+        label = ":".join(parts[2:])
+        await db.remove_token(label)
+        n = await POOL.reload()
+        await q.answer(f"Removed · pool = {n}")
+        await _safe_edit_q(q, await adm.keys_text(),
+                           adm.keys_kb(await db.list_tokens()))
+        return
+
+    # ----- broadcast -----
+    if action == "bc" and len(parts) > 2 and parts[2] == "ask":
+        n = await db.count_users(db.ACTIVE)
+        PENDING_INPUT[admin_id] = {"kind": "broadcast"}
+        await _safe_edit_q(
+            q,
+            f"📣 <b>Broadcast to {n} active user(s)</b>\n\n"
+            "Send the message now. HTML formatting is supported.\n"
+            "<i>/cancel to abort.</i>")
+        return
+
+
+async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
+    """Consume a typed admin input (key / broadcast / DM). Returns True if used."""
+    uid = update.effective_user.id
+    text = (update.message.text or "").strip()
+    kind = pending.get("kind")
+    PENDING_INPUT.pop(uid, None)
+
+    if kind == "addkey":
+        if "=" not in text:
+            await update.message.reply_html(
+                "❌ Wrong format. Use <code>label = token</code>")
+            return True
+        label, token = text.split("=", 1)
+        label, token = label.strip(), token.strip()
+        if not label or not token:
+            await update.message.reply_html("❌ Label and token are required.")
+            return True
+        ok = await db.add_token(token, label)
+        if not ok:
+            await update.message.reply_html(
+                f"❌ A key labelled <b>{html.escape(label)}</b> already exists.")
+            return True
+        n = await POOL.reload()
+        await update.message.reply_html(
+            f"✅ Key <b>{html.escape(label)}</b> added.\n\n"
+            f"Pool is now <b>{n}</b> key(s) → <b>{n}</b> user(s) can chat "
+            f"simultaneously.")
+        return True
+
+    if kind == "dm":
+        target = pending.get("target")
+        try:
+            await ctx.bot.send_message(
+                chat_id=target,
+                text=f"✉️ <b>Message from admin</b>\n\n{text}",
+                parse_mode="HTML")
+            await update.message.reply_html("✅ Sent.")
+        except Exception as e:
+            await update.message.reply_html(
+                f"❌ Could not deliver: {html.escape(str(e))[:150]}")
+        return True
+
+    if kind == "broadcast":
+        async with Progress(ctx.bot, update.effective_chat.id,
+                            "📣 Broadcasting",
+                            steps=["Collecting recipients", "Sending"]) as p:
+            await p.step(0)
+            await p.step(1)
+
+            async def cb(done, st):
+                await p.note(f"{done} sent · {st['failed']} failed")
+
+            stats = await adm.broadcast(ctx.bot, text, uid, progress_cb=cb)
+        await update.message.reply_html(
+            "📣 <b>Broadcast finished</b>\n\n"
+            f"• Recipients: <b>{stats['total']}</b>\n"
+            f"• Delivered: <b>{stats['sent']}</b>\n"
+            f"• Blocked the bot: <b>{stats['blocked']}</b>\n"
+            f"• Failed: <b>{stats['failed']}</b>")
+        return True
+
+    return False
+
+
 # ---------- Voice input ----------
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id): return
+    if not await gate(update): return
     msg = update.message
     voice = msg.voice or msg.audio
     if not voice: return
@@ -770,7 +1143,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Media ----------
 async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id): return
+    if not await gate(update): return
     s = get_state(update.effective_user.id)
     msg = update.message
 
@@ -812,7 +1185,13 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await p.step(1, "Sending to DeepSeek servers")
             await p.step(2, "Running OCR / text extraction"
                             if is_photo else "Parsing document")
-            fid, fname, err = await asyncio.to_thread(ds.upload_file_ex, tmp_path)
+            res = await ds_op(update.effective_user.id, 'upload_file_ex', tmp_path,
+                              timeout=KEY_WAIT_TIMEOUT)
+            if res is None:
+                fid, fname, err = None, None, (
+                    "No DeepSeek key was free in time. Please try again.")
+            else:
+                fid, fname, err = res
         finally:
             if tmp_path:
                 try: os.unlink(tmp_path)
@@ -837,7 +1216,7 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         # success → bar auto-deletes on context exit
 
-    s.attached_files.append([fid, fname]); save_state()
+    s.attached_files.append([fid, fname]); await save_session(update.effective_user.id)
 
     if caption:
         await _process_prompt_chat(
@@ -851,9 +1230,17 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Text ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id): return
+    if not await gate(update): return
+    uid = update.effective_user.id
+
+    # An admin may be mid-flow typing a key / broadcast / DM
+    pending = PENDING_INPUT.get(uid)
+    if pending and is_admin(uid):
+        if await handle_admin_input(update, ctx, pending):
+            return
+
     text = update.message.text
-    s = get_state(update.effective_user.id)
+    s = get_state(uid)
 
     # URL detection
     if s.auto_urls:
@@ -1028,11 +1415,11 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     s = get_state(user_id)
 
     if not s.session_id:
-        sid = await asyncio.to_thread(ds.create_chat)
+        sid = await ds_op(user_id, 'create_chat')
         if not sid:
             await ctx.bot.send_message(chat_id=chat_id, text="❌ Session creation failed")
             return
-        s.session_id = sid; s.parent_msg_id = None; save_state()
+        s.session_id = sid; s.parent_msg_id = None; await save_session(user_id)
 
     parent_before = s.parent_msg_id
     thinking_on = bool(s.thinking)
@@ -1050,7 +1437,7 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
 
     # Record user turn in history (original prompt, not persona-wrapped)
     if not is_regen and not is_quick_action:
-        record_history(user_id, "user", prompt)
+        await record_history(user_id, "user", prompt)
 
     await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
     placeholder = await ctx.bot.send_message(
@@ -1072,17 +1459,20 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     last_edit = 0.0
     edit_interval = 1.3
 
-    async def stream_iter():
-        loop = asyncio.get_event_loop()
-        gen = ds.chat_stream(
-            s.session_id, s.parent_msg_id, final_prompt,
-            model_type=mode, thinking=thinking_on, search=search_on,
-            file_ids=file_ids,
-        )
-        while True:
-            ev = await loop.run_in_executor(None, next, gen, None)
-            if ev is None: break
-            yield ev
+    def stream_iter(client):
+        """Bridge the blocking generator onto the event loop."""
+        async def _gen():
+            loop = asyncio.get_event_loop()
+            gen = client.chat_stream(
+                s.session_id, s.parent_msg_id, final_prompt,
+                model_type=mode, thinking=thinking_on, search=search_on,
+                file_ids=file_ids,
+            )
+            while True:
+                ev = await loop.run_in_executor(None, next, gen, None)
+                if ev is None: break
+                yield ev
+        return _gen()
 
     async def safe_edit(msg, text: str, kb=None):
         try:
@@ -1103,144 +1493,185 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                 log.debug("plain fallback: %s", e2)
 
     full_answer = ""
-    try:
-        got_any = False
-        async for ev in stream_iter():
-            if user_id in CANCELLED:
-                CANCELLED.discard(user_id)
-                await waiter.stop()
-                await safe_edit(messages[-1],
-                                 (md_to_tg_html(current_text) + "\n\n<i>⏹ Stopped.</i>")
-                                 if current_text else "⏹ <i>Stopped.</i>",
-                                 kb=response_footer_kb(has_text=bool(current_text)))
-                return
-            if not got_any:
-                # first event from DeepSeek → stop the waiting animation so it
-                # can't overwrite the streaming answer
-                await waiter.stop()
-            got_any = True
-            if ev['type'] == 'msg_id':
-                s.parent_msg_id = ev['id']; continue
-            if ev['type'] == 'error':
-                await safe_edit(messages[-1], f"❌ {html.escape(ev['msg'])}",
-                                kb=response_footer_kb(has_text=False))
-                return
-            if ev['type'] == 'think':
-                if answer_started or not thinking_on: continue
-                think_buf += ev['text']
-            elif ev['type'] == 'answer':
-                if not answer_started:
-                    answer_started = True
-                    current_text = ""
-                current_text += ev['text']
-                full_answer += ev['text']
-
-                if len(current_text) > MAX_TG_MSG:
-                    cut = MAX_TG_MSG
-                    tail = current_text[:cut]
-                    nl = tail.rfind("\n"); sp = tail.rfind(" ")
-                    if nl > cut - 400: cut = nl
-                    elif sp > cut - 200: cut = sp
-                    sealed = current_text[:cut]
-                    remainder = current_text[cut:].lstrip()
-
-                    sealed_html = safe_for_telegram(md_to_tg_html(sealed), MAX_TG_MSG)
-                    await safe_edit(messages[-1], sealed_html, kb=None)
-                    new_bubble = await ctx.bot.send_message(chat_id=chat_id, text="⏳ …")
-                    messages.append(new_bubble)
-                    current_text = remainder
-                    last_edit = 0.0
-
-            now = asyncio.get_event_loop().time()
-            if now - last_edit > edit_interval:
-                last_edit = now
-                if answer_started:
-                    partial = strip_incomplete_markers(current_text)
-                    txt = md_to_tg_html(partial) + " ▍"
-                else:
-                    if thinking_on and think_buf:
-                        txt = _ticker_view(think_buf)
-                    else:
-                        txt = "⏳ <i>thinking…</i>"
-                txt = safe_for_telegram(txt, MAX_TG_MSG)
-                await safe_edit(messages[-1], txt)
-
-        if not got_any:
-            await waiter.stop()
-            await safe_edit(messages[-1],
-                             "❌ <b>No response from DeepSeek.</b>\n\n"
-                             "<i>💡 Your token may have expired, or DeepSeek "
-                             "servers are busy. Try 'New Chat'.</i>",
-                             kb=response_footer_kb(has_text=False))
-            return
-
-        # Cache
-        LAST[user_id] = {
-            'prompt': prompt, 'raw_answer': full_answer,
-            'session_id': s.session_id, 'parent': s.parent_msg_id,
-            'parent_before': parent_before,
-        }
-        # Track bot response in history (skip regen since it replaces)
-        if not is_regen and not is_quick_action:
-            record_history(user_id, "assistant", full_answer)
-
-        s.total_chars_out += len(full_answer); save_state()
-
-        total_len = len(full_answer)
-
-        if total_len > FILE_THRESHOLD:
-            preview_html = md_to_tg_html(full_answer[:2500]) + "\n\n<i>… (see file below)</i>"
-            preview_html = safe_for_telegram(preview_html, MAX_TG_MSG)
-            await safe_edit(messages[0], preview_html, kb=None)
-            for extra in messages[1:]:
-                try: await ctx.bot.delete_message(chat_id=chat_id,
-                                                    message_id=extra.message_id)
-                except: pass
-            await _send_response_file(ctx, chat_id, prompt, full_answer)
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=f"📄 Full response ({total_len:,} chars) attached above.",
-                reply_markup=response_footer_kb(has_text=True),
-            )
-        else:
-            if not answer_started:
-                final = "⚠️ Model didn't produce an answer."
-            else:
-                final = md_to_tg_html(current_text) if current_text else "(empty)"
-            final = safe_for_telegram(final, MAX_TG_MSG)
-            await safe_edit(messages[-1], final,
-                             kb=response_footer_kb(has_text=answer_started))
-
-        # Auto-TTS if voice_reply is ON
-        if s.voice_reply and answer_started and full_answer.strip():
-            await _send_tts(ctx, chat_id, full_answer, s.tts_female)
-
-        # Detach files after send
-        s.attached_files = []; save_state()
-
-    except Exception as e:
-        log.exception("stream error")
-        try:
-            await safe_edit(messages[-1], f"❌ Error: {html.escape(str(e))}",
-                             kb=response_footer_kb(has_text=False))
-        except: pass
-    finally:
-        # guarantee the animator never outlives the request
+    # Hold a DeepSeek key for the entire stream. N keys => N conversations can
+    # run at the same time; everyone else queues here until one frees up.
+    async with POOL.acquire(user_id, timeout=KEY_WAIT_TIMEOUT) as lease:
+      if lease is None:
         await waiter.stop()
+        if POOL.size == 0:
+            oops = ("❌ <b>No DeepSeek key configured</b>\n\n"
+                    "<i>Ask the admin to add one from the admin panel.</i>")
+        else:
+            oops = ("🕒 <b>All slots are busy</b>\n\n"
+                    f"This bot has <b>{POOL.size}</b> DeepSeek key(s), so "
+                    f"<b>{POOL.size}</b> chat(s) can run at once.\n"
+                    "<i>Please send your message again in a moment.</i>")
+        await safe_edit(messages[-1], oops,
+                        kb=response_footer_kb(has_text=False))
+        return
+      try:
+          got_any = False
+          async for ev in stream_iter(lease.client):
+              if user_id in CANCELLED:
+                  CANCELLED.discard(user_id)
+                  await waiter.stop()
+                  await safe_edit(messages[-1],
+                                   (md_to_tg_html(current_text) + "\n\n<i>⏹ Stopped.</i>")
+                                   if current_text else "⏹ <i>Stopped.</i>",
+                                   kb=response_footer_kb(has_text=bool(current_text)))
+                  return
+              if not got_any:
+                  # first event from DeepSeek → stop the waiting animation so it
+                  # can't overwrite the streaming answer
+                  await waiter.stop()
+              got_any = True
+              if ev['type'] == 'msg_id':
+                  s.parent_msg_id = ev['id']; continue
+              if ev['type'] == 'error':
+                  await safe_edit(messages[-1], f"❌ {html.escape(ev['msg'])}",
+                                  kb=response_footer_kb(has_text=False))
+                  return
+              if ev['type'] == 'think':
+                  if answer_started or not thinking_on: continue
+                  think_buf += ev['text']
+              elif ev['type'] == 'answer':
+                  if not answer_started:
+                      answer_started = True
+                      current_text = ""
+                  current_text += ev['text']
+                  full_answer += ev['text']
+
+                  if len(current_text) > MAX_TG_MSG:
+                      cut = MAX_TG_MSG
+                      tail = current_text[:cut]
+                      nl = tail.rfind("\n"); sp = tail.rfind(" ")
+                      if nl > cut - 400: cut = nl
+                      elif sp > cut - 200: cut = sp
+                      sealed = current_text[:cut]
+                      remainder = current_text[cut:].lstrip()
+
+                      sealed_html = safe_for_telegram(md_to_tg_html(sealed), MAX_TG_MSG)
+                      await safe_edit(messages[-1], sealed_html, kb=None)
+                      new_bubble = await ctx.bot.send_message(chat_id=chat_id, text="⏳ …")
+                      messages.append(new_bubble)
+                      current_text = remainder
+                      last_edit = 0.0
+
+              now = asyncio.get_event_loop().time()
+              if now - last_edit > edit_interval:
+                  last_edit = now
+                  if answer_started:
+                      partial = strip_incomplete_markers(current_text)
+                      txt = md_to_tg_html(partial) + " ▍"
+                  else:
+                      if thinking_on and think_buf:
+                          txt = _ticker_view(think_buf)
+                      else:
+                          txt = "⏳ <i>thinking…</i>"
+                  txt = safe_for_telegram(txt, MAX_TG_MSG)
+                  await safe_edit(messages[-1], txt)
+
+          if not got_any:
+              await waiter.stop()
+              await safe_edit(messages[-1],
+                               "❌ <b>No response from DeepSeek.</b>\n\n"
+                               "<i>💡 Your token may have expired, or DeepSeek "
+                               "servers are busy. Try 'New Chat'.</i>",
+                               kb=response_footer_kb(has_text=False))
+              return
+
+          # Cache
+          LAST[user_id] = {
+              'prompt': prompt, 'raw_answer': full_answer,
+              'session_id': s.session_id, 'parent': s.parent_msg_id,
+              'parent_before': parent_before,
+          }
+          # Track bot response in history (skip regen since it replaces)
+          if not is_regen and not is_quick_action:
+              await record_history(user_id, "assistant", full_answer)
+
+          s.total_chars_out += len(full_answer)
+          await save_session(user_id)
+          await db.bump_usage(user_id, messages=0 if is_regen else 1,
+                              chars_in=len(prompt), chars_out=len(full_answer))
+
+          total_len = len(full_answer)
+
+          if total_len > FILE_THRESHOLD:
+              preview_html = md_to_tg_html(full_answer[:2500]) + "\n\n<i>… (see file below)</i>"
+              preview_html = safe_for_telegram(preview_html, MAX_TG_MSG)
+              await safe_edit(messages[0], preview_html, kb=None)
+              for extra in messages[1:]:
+                  try: await ctx.bot.delete_message(chat_id=chat_id,
+                                                      message_id=extra.message_id)
+                  except: pass
+              await _send_response_file(ctx, chat_id, prompt, full_answer)
+              await ctx.bot.send_message(
+                  chat_id=chat_id,
+                  text=f"📄 Full response ({total_len:,} chars) attached above.",
+                  reply_markup=response_footer_kb(has_text=True),
+              )
+          else:
+              if not answer_started:
+                  final = "⚠️ Model didn't produce an answer."
+              else:
+                  final = md_to_tg_html(current_text) if current_text else "(empty)"
+              final = safe_for_telegram(final, MAX_TG_MSG)
+              await safe_edit(messages[-1], final,
+                               kb=response_footer_kb(has_text=answer_started))
+
+          # Auto-TTS if voice_reply is ON
+          if s.voice_reply and answer_started and full_answer.strip():
+              await _send_tts(ctx, chat_id, full_answer, s.tts_female)
+
+          # Detach files after send
+          s.attached_files = []; await save_session(user_id)
+
+      except Exception as e:
+          log.exception("stream error")
+          try:
+              await safe_edit(messages[-1], f"❌ Error: {html.escape(str(e))}",
+                               kb=response_footer_kb(has_text=False))
+          except: pass
+      finally:
+          # guarantee the animator never outlives the request
+          await waiter.stop()
 
 
 # ---------- Post-init ----------
 async def _post_init(app):
+    log.info("post_init: connecting to MongoDB…")
     try:
+        await db.connect()
+        # Make sure the owner exists and is an admin
+        await db.upsert_user(OWNER_ID, status=db.ACTIVE, role="admin")
+        USERS[OWNER_ID] = await db.get_user(OWNER_ID)
+
+        # Seed the pool from DEEPSEEK_TOKEN the first time only
+        if DEEPSEEK_TOKEN and not await db.list_tokens():
+            await db.add_token(DEEPSEEK_TOKEN, "primary")
+            log.info("Seeded key pool from DEEPSEEK_TOKEN")
+        n_keys = await POOL.reload()
+        log.info("DeepSeek key pool: %d key(s)", n_keys)
+
+        app.bot_data["wipe_task"] = asyncio.create_task(
+            nightly_wipe_loop(app.bot, OWNER_ID))
+
         await app.bot.set_my_commands([
             BotCommand("start", "Open the menu"),
             BotCommand("help", "Usage guide"),
             BotCommand("cancel", "Stop the running task"),
         ])
+        await app.bot.set_my_commands([
+            BotCommand("start", "Open the menu"),
+            BotCommand("help", "Usage guide"),
+            BotCommand("cancel", "Stop the running task"),
+            BotCommand("admin", "Admin panel"),
+        ], scope=BotCommandScopeChat(chat_id=OWNER_ID))
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v5"
+        version = "v6"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:
@@ -1250,12 +1681,12 @@ async def _post_init(app):
         if seen != version:
             await app.bot.send_message(
                 chat_id=OWNER_ID,
-                text="🚀 <b>Bot v5 is live</b>\n\n"
-                     "✨ New: progress bars on every long task, /cancel, "
-                     "persistent history, rate limiting\n"
-                     "🐛 Fixed: photo/file uploads, silent crashes, "
-                     "blocked buttons\n\n"
-                     "/start for the menu.",
+                text="🚀 <b>Bot v6 is live — multi-user</b>\n\n"
+                     "👥 Users, approvals, blocking, broadcast\n"
+                     "🔑 DeepSeek key pool — each key = one more "
+                     "simultaneous user\n"
+                     "🗄 MongoDB storage · chats auto-delete nightly\n\n"
+                     "/admin for the control panel.",
                 parse_mode="HTML",
             )
             try:
@@ -1264,7 +1695,7 @@ async def _post_init(app):
             except Exception:
                 pass
     except Exception as e:
-        log.warning("post_init: %s", e)
+        log.exception("post_init failed: %s", e)
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1312,6 +1743,7 @@ def build_app():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_media))
@@ -1323,11 +1755,13 @@ def build_app():
 async def _run_with_health():
     """Run bot polling + tiny HTTP server (for Render Web Service)."""
     from health import start_health_server
-    load_state()
     app = build_app()
     runner = await start_health_server()
     try:
         await app.initialize()
+        # Application.initialize() does not invoke post_init on this manual
+        # start path (only run_polling does), so call it ourselves.
+        await _post_init(app)
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES,
                                           drop_pending_updates=True)
@@ -1335,6 +1769,11 @@ async def _run_with_health():
         while True:
             await asyncio.sleep(3600)
     finally:
+        t = app.bot_data.get("wipe_task")
+        if t:
+            t.cancel()
+            try: await t
+            except (asyncio.CancelledError, Exception): pass
         try: await app.updater.stop()
         except: pass
         try: await app.stop()
@@ -1343,13 +1782,14 @@ async def _run_with_health():
         except: pass
         try: await runner.cleanup()
         except: pass
+        try: await db.close()
+        except: pass
 
 
 def main():
     if ENABLE_HEALTH:
         asyncio.run(_run_with_health())
     else:
-        load_state()
         app = build_app()
         log.info("Bot starting (polling only)…")
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

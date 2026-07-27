@@ -7,9 +7,84 @@ os.environ["STATE_FILE"] = "test_state.json"
 if os.path.exists("test_state.json"): os.unlink("test_state.json")
 
 import bot
-from bot import (STATE, LAST, HISTORY, OWNER_ID, get_state, RULES,
+from bot import (STATE, LAST, OWNER_ID, get_state, RULES,
                  start_cmd, help_cmd, on_button, on_text, on_media, on_voice,
                  MAX_TG_MSG, FILE_THRESHOLD)
+
+# --- v6: DeepSeek access moved behind an async key pool + MongoDB. These
+# tests stay offline, so both are stubbed out here, once, before any handler
+# runs. install_fakes() then just swaps in the per-test client mock. ---
+from contextlib import asynccontextmanager
+import bot as _bot
+
+_FAKE_TURNS = []          # rows record_history() would have written
+_CLIENT = MagicMock()     # current stand-in for a DeepSeekClient
+
+
+class _FakeLease:
+    label = "test"
+    token = "t"
+
+    @property
+    def client(self):
+        return _CLIENT
+
+
+@asynccontextmanager
+async def _fake_acquire(uid, timeout=None):
+    yield _FakeLease()
+
+
+async def _fake_ds_op(uid, method, *a, timeout=60.0):
+    return getattr(_CLIENT, method)(*a)
+
+
+async def _noop(*a, **k):
+    return None
+
+
+async def _fake_turn(uid, role, text):
+    _FAKE_TURNS.append((uid, role, text))
+
+
+async def _fake_hist(uid, limit=100):
+    return [{"role": r, "text": t, "ts": 0}
+            for u, r, t in _FAKE_TURNS if u == uid][-limit:]
+
+
+async def _fake_gate(update):
+    """Offline stand-in for the real access gate: owner only."""
+    uid = update.effective_user.id
+    if uid == OWNER_ID:
+        _bot.USERS[uid] = {"status": "active", "role": "admin"}
+        return True
+    await update.message.reply_text("🔒 This bot is invite-only.")
+    return False
+
+
+def _install_stubs():
+    _bot.POOL.acquire = _fake_acquire
+    type(_bot.POOL).size = property(lambda self: 1)
+    _bot.ds_op = _fake_ds_op
+    _bot.gate = _fake_gate
+    _bot.db.add_turn = _fake_turn
+    _bot.db.get_history = _fake_hist
+    for name in ("set_user_field", "bump_usage", "upsert_user",
+                 "clear_history", "mark_token", "set_user_status",
+                 "bump_token_use"):
+        setattr(_bot.db, name, _noop)
+    _bot.save_settings = _noop
+    _bot.save_session = _noop
+
+
+_install_stubs()
+
+
+def install_fakes(client):
+    """Point the pool's lease at `client` for the next block of assertions."""
+    global _CLIENT
+    _CLIENT = client
+    _install_stubs()
 from personas import PERSONAS
 
 PASS = FAIL = 0
@@ -105,7 +180,8 @@ async def run():
 
     print("\n===== 5. Session mgmt (mocked) =====")
     STATE.clear()
-    with patch("bot.ds") as md:
+    md = MagicMock(); install_fakes(md)
+    if True:
         md.create_chat.return_value = "sess-1"
         md.list_chats.return_value = [{"id": "s1", "title": "T", "model_type": "expert"}]
         md.get_history.return_value = ([], "p1")
@@ -126,16 +202,17 @@ async def run():
         ok("wipe", md.delete_all_chats.called)
 
     print("\n===== 6. Text streaming + history =====")
-    STATE.clear(); HISTORY.clear()
+    STATE.clear(); _FAKE_TURNS.clear()
     def gen(*a, **k):
         yield {'type': 'msg_id', 'id': 'r1'}
         yield {'type': 'answer', 'text': 'Hello **world**!'}
-    with patch("bot.ds") as md:
+    md = MagicMock(); install_fakes(md)
+    if True:
         md.create_chat.return_value = "s"
         md.chat_stream = gen
         u = mk_update(text="hi"); await on_text(u, mk_ctx())
         ok("LAST cached", LAST.get(OWNER_ID) is not None)
-        ok("history recorded", len(HISTORY.get(OWNER_ID, [])) == 2)
+        ok("history recorded", len([t for t in _FAKE_TURNS if t[0] == OWNER_ID]) == 2)
         ok("msg_count incremented", get_state(OWNER_ID).msg_count == 1)
 
     print("\n===== 7. Long response → file =====")
@@ -145,10 +222,15 @@ async def run():
         yield {'type': 'msg_id', 'id': 'rb'}
         for i in range(0, len(big), 500):
             yield {'type': 'answer', 'text': big[i:i+500]}
-    with patch("bot.ds") as md, patch("bot._send_response_file") as sfile:
+    md = MagicMock(); install_fakes(md)
+    if True:
+        sfile = AsyncMock()
+        _orig_sfile = _bot._send_response_file
+        _bot._send_response_file = sfile
         md.create_chat.return_value = "sb"; md.chat_stream = gen_big
         u = mk_update(text="big"); await on_text(u, mk_ctx())
         ok("file sent for huge", sfile.called)
+        _bot._send_response_file = _orig_sfile
 
     print("\n===== 8. Response actions =====")
     STATE.clear(); LAST.clear()
@@ -216,7 +298,9 @@ async def run():
     def gv(*a, **k):
         yield {'type': 'msg_id', 'id': 'rv'}
         yield {'type': 'answer', 'text': 'Voice response'}
-    with patch("bot.ds") as md, patch("bot._send_tts", side_effect=fake_tts2):
+    md = MagicMock(); install_fakes(md)
+    _bot._send_tts = fake_tts2
+    if True:
         md.create_chat.return_value = "sv"; md.chat_stream = gv
         u = mk_update(text="say hi"); await on_text(u, mk_ctx())
     ok("voice_reply auto TTS", tts_sent.get('t') == 'Voice response')
@@ -235,7 +319,8 @@ async def run():
     ctx = mk_ctx()
     async def _send(**k): return tb
     ctx.bot.send_message = AsyncMock(side_effect=_send)
-    with patch("bot.ds") as md:
+    md = MagicMock(); install_fakes(md)
+    if True:
         md.create_chat.return_value = "sl"; md.chat_stream = gl
         u = mk_update(text="hi"); await on_text(u, ctx)
     ok("no thinking leak", "LEAK_TEXT" not in "\n".join(edits))

@@ -10,6 +10,8 @@ services:
         sync: false
       - key: DEEPSEEK_TOKEN
         sync: false
+      - key: MONGO_URL
+        sync: false
       - key: OWNER_ID
         sync: false
       - key: WHISPER_SIZE

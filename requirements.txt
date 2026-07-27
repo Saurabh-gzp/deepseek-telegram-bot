@@ -13,3 +13,7 @@ youtube-transcript-api>=1.0.0
 
 # Health server
 aiohttp>=3.9
+
+# Database (multi-user storage)
+motor>=3.5
+pymongo>=4.8

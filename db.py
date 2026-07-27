@@ -66,6 +66,7 @@ async def connect() -> None:
     await _db.history.create_index([("uid", ASCENDING), ("ts", ASCENDING)])
     # TTL: Mongo deletes the document once expires_at is in the past
     await _db.history.create_index("expires_at", expireAfterSeconds=0)
+    await _db.invites.create_index([("created_at", DESCENDING)])
 
     log.info("MongoDB connected (db=%s)", DB_NAME)
 
@@ -219,6 +220,85 @@ async def global_stats() -> Dict[str, Any]:
         "chars_out": totals["cout"],
         "turns_stored": await _db.history.count_documents({}),
     }
+
+
+# --------------------------------------------------------------------------
+# Invites
+# --------------------------------------------------------------------------
+
+async def create_invite(code: str, created_by: int, *, max_uses: int = 1,
+                        expires_in_h: int = 0, note: str = "") -> Dict[str, Any]:
+    """Store a fresh invite code. expires_in_h=0 means it never expires."""
+    doc = {
+        "_id": code,
+        "created_by": created_by,
+        "created_at": _now(),
+        "max_uses": max_uses,
+        "uses": 0,
+        "used_by": [],
+        "revoked": False,
+        "note": note,
+        "expires_at": (_now() + expires_in_h * 3600) if expires_in_h else 0,
+    }
+    await _db.invites.insert_one(doc)
+    return doc
+
+
+async def get_invite(code: str) -> Optional[Dict[str, Any]]:
+    return await _db.invites.find_one({"_id": code})
+
+
+async def list_invites(include_dead: bool = False) -> List[Dict[str, Any]]:
+    q = {} if include_dead else {"revoked": False}
+    cur = _db.invites.find(q).sort("created_at", DESCENDING).limit(25)
+    return [d async for d in cur]
+
+
+async def revoke_invite(code: str) -> bool:
+    r = await _db.invites.update_one({"_id": code},
+                                     {"$set": {"revoked": True}})
+    return r.matched_count > 0
+
+
+def invite_state(inv: Dict[str, Any]) -> str:
+    """'ok' | 'revoked' | 'expired' | 'used_up'"""
+    if not inv or inv.get("revoked"):
+        return "revoked"
+    exp = inv.get("expires_at") or 0
+    if exp and _now() > exp:
+        return "expired"
+    if inv.get("uses", 0) >= inv.get("max_uses", 1):
+        return "used_up"
+    return "ok"
+
+
+async def redeem_invite(code: str, uid: int) -> str:
+    """
+    Atomically consume one use of `code` for `uid`.
+
+    Returns 'ok' on success, otherwise the reason it failed. The filter does
+    the checking, so two people racing on the last slot cannot both win.
+    """
+    inv = await get_invite(code)
+    if not inv:
+        return "invalid"
+    # A user re-opening their own link must not be rejected, even once the
+    # link is otherwise used up or expired.
+    if uid in (inv.get("used_by") or []):
+        return "revoked" if inv.get("revoked") else "ok"
+    state = invite_state(inv)
+    if state != "ok":
+        return state
+
+    res = await _db.invites.find_one_and_update(
+        {"_id": code, "revoked": False,
+         "$expr": {"$lt": ["$uses", "$max_uses"]}},
+        {"$inc": {"uses": 1}, "$addToSet": {"used_by": uid}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not res:
+        return "used_up"
+    return "ok"
 
 
 # --------------------------------------------------------------------------

@@ -39,11 +39,95 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 Users", callback_data="adm:users:active:0"),
          InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
+        [InlineKeyboardButton("➕ Invite a user", callback_data="adm:inv:menu")],
         [InlineKeyboardButton("🔑 DeepSeek keys", callback_data="adm:keys"),
          InlineKeyboardButton("📣 Broadcast", callback_data="adm:bc:ask")],
         [InlineKeyboardButton("🚪 Access mode", callback_data="adm:mode")],
         [InlineKeyboardButton("🔙 Back to bot", callback_data="cmd:refresh")],
     ])
+
+
+def invite_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Create invite link",
+                              callback_data="adm:inv:new:1:0")],
+        [InlineKeyboardButton("🔗 Multi-use (10)",
+                              callback_data="adm:inv:new:10:0"),
+         InlineKeyboardButton("⏱ 24h link",
+                              callback_data="adm:inv:new:1:24")],
+        [InlineKeyboardButton("🆔 Add user by ID",
+                              callback_data="adm:inv:byid")],
+        [InlineKeyboardButton("📋 Active links", callback_data="adm:inv:list")],
+        [InlineKeyboardButton("🔙 Admin menu", callback_data="adm:menu")],
+    ])
+
+
+def invite_created_kb(link: str, code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Share this link",
+                              switch_inline_query=(
+                                  f"Join me on this AI bot: {link}"))],
+        [InlineKeyboardButton("🗑 Revoke", callback_data=f"adm:inv:rv:{code}"),
+         InlineKeyboardButton("📋 Active links", callback_data="adm:inv:list")],
+        [InlineKeyboardButton("🔙 Invite menu", callback_data="adm:inv:menu")],
+    ])
+
+
+def invite_list_kb(invites: List[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for inv in invites[:10]:
+        left = inv.get("max_uses", 1) - inv.get("uses", 0)
+        rows.append([InlineKeyboardButton(
+            f"🔗 {inv['_id'][:10]}… · {left} left",
+            callback_data=f"adm:inv:show:{inv['_id']}")])
+    rows.append([InlineKeyboardButton("🔙 Invite menu",
+                                      callback_data="adm:inv:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def invite_link(bot_username: str, code: str) -> str:
+    return f"https://t.me/{bot_username}?start={code}"
+
+
+async def invite_menu_text() -> str:
+    active = await db.list_invites()
+    live = [i for i in active if db.invite_state(i) == "ok"]
+    return (
+        "➕ <b>Invite a user</b>\n\n"
+        "Two ways to let someone in:\n\n"
+        "🔗 <b>Invite link</b> — send them a link. When they open it they are "
+        "approved automatically, no action needed from you.\n\n"
+        "🆔 <b>Add by ID</b> — if you already know their Telegram numeric ID, "
+        "approve them right now. They get a message telling them they're in.\n\n"
+        f"<b>{len(live)}</b> link(s) currently active."
+    )
+
+
+async def invite_detail_text(inv: dict, bot_username: str) -> str:
+    state = db.invite_state(inv)
+    badge = {"ok": "🟢 Active", "revoked": "🗑 Revoked",
+             "expired": "⌛ Expired", "used_up": "✅ Fully used"}[state]
+    link = invite_link(bot_username, inv["_id"])
+    created = time.strftime("%Y-%m-%d %H:%M",
+                            time.localtime(inv.get("created_at", 0)))
+    lines = [
+        "🔗 <b>Invite link</b>\n",
+        f"<code>{html.escape(link)}</code>\n",
+        f"• Status: <b>{badge}</b>",
+        f"• Used: <b>{inv.get('uses', 0)}</b> / {inv.get('max_uses', 1)}",
+        f"• Created: {created}",
+    ]
+    exp = inv.get("expires_at") or 0
+    if exp:
+        lines.append("• Expires: " + time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(exp)))
+    else:
+        lines.append("• Expires: never")
+    if inv.get("used_by"):
+        lines.append(f"• Joined via this link: "
+                     f"{', '.join(f'<code>{u}</code>' for u in inv['used_by'][:10])}")
+    lines.append("\n<i>Tap and hold the link above to copy it.</i>")
+    return "\n".join(lines)
 
 
 def users_kb(users: List[dict], status: str, page: int,
@@ -73,7 +157,10 @@ def users_kb(users: List[dict], status: str, page: int,
         InlineKeyboardButton("⏳ Pending", callback_data="adm:users:pending:0"),
         InlineKeyboardButton("🚫 Blocked", callback_data="adm:users:blocked:0"),
     ])
-    rows.append([InlineKeyboardButton("🔙 Admin menu", callback_data="adm:menu")])
+    rows.append([
+        InlineKeyboardButton("➕ Invite a user", callback_data="adm:inv:menu"),
+        InlineKeyboardButton("🔙 Admin menu", callback_data="adm:menu"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 

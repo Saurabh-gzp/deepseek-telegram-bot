@@ -26,6 +26,7 @@ import html
 import logging
 import os
 import re
+import secrets
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -510,10 +511,65 @@ async def _request_approval(update: Update, u) -> None:
 
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # /start <code> — someone followed an invite link
+    code = (ctx.args[0].strip() if getattr(ctx, "args", None) else "")
+    if code and uid != OWNER_ID:
+        if await _try_redeem(update, ctx, uid, code):
+            return   # _try_redeem already replied on failure
+
     if not await gate(update):
         return
-    await send_menu(update, get_state(update.effective_user.id),
-                    uid=update.effective_user.id)
+    await send_menu(update, get_state(uid), uid=uid)
+
+
+async def _try_redeem(update: Update, ctx, uid: int, code: str) -> bool:
+    """
+    Redeem an invite code. Returns True when the caller should stop
+    (the code was bad and the user has been told why).
+    """
+    u = update.effective_user
+    if uid not in USERS:
+        await load_user(uid, username=u.username or "",
+                        first_name=u.first_name or "")
+
+    # Already in? The link is just a no-op.
+    if user_status(uid) == db.ACTIVE:
+        return False
+    if user_status(uid) == db.BLOCKED:
+        return True   # stay silent for blocked users
+
+    result = await db.redeem_invite(code, uid)
+    if result == "ok":
+        await db.set_user_status(uid, db.ACTIVE)
+        USERS.setdefault(uid, {})["status"] = db.ACTIVE
+        PENDING_NOTIFIED.pop(uid, None)
+        await update.message.reply_html(
+            "🎉 <b>Welcome! Your invite has been accepted.</b>\n\n"
+            "You now have full access. Here's your menu:")
+        try:
+            await ctx.bot.send_message(
+                chat_id=OWNER_ID,
+                text=("🔗 <b>Invite link used</b>\n\n"
+                      f"• Name: {html.escape(u.first_name or '—')}\n"
+                      f"• Username: @{html.escape(u.username or '—')}\n"
+                      f"• ID: <code>{uid}</code>"),
+                parse_mode="HTML", disable_notification=True)
+        except Exception:
+            pass
+        return False   # fall through so the menu is sent
+
+    reason = {
+        "invalid": "This invite link is not valid.",
+        "revoked": "This invite link has been revoked.",
+        "expired": "This invite link has expired.",
+        "used_up": "This invite link has already been used up.",
+    }.get(result, "This invite link cannot be used.")
+    await update.message.reply_html(
+        f"❌ <b>{reason}</b>\n\n"
+        "<i>Ask the admin for a fresh link.</i>")
+    return True
 
 
 async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -835,6 +891,16 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- Admin panel ----------
+async def _bot_username(ctx) -> str:
+    """Cached bot username, needed to build t.me invite links."""
+    uname = ctx.bot_data.get("bot_username")
+    if not uname:
+        me = await ctx.bot.get_me()
+        uname = me.username
+        ctx.bot_data["bot_username"] = uname
+    return uname
+
+
 async def _safe_edit_q(q, text: str, kb=None):
     try:
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
@@ -935,6 +1001,74 @@ async def handle_admin(q, ctx, data: str):
             q, f"✉️ <b>Send the message for user <code>{uid}</code></b>\n\n"
                "<i>Type it now, or /cancel to abort.</i>")
         return
+
+    # ----- invites -----
+    if action == "inv":
+        sub = parts[2] if len(parts) > 2 else "menu"
+
+        if sub == "menu":
+            await _safe_edit_q(q, await adm.invite_menu_text(),
+                               adm.invite_menu_kb())
+            return
+
+        if sub == "new":
+            max_uses = int(parts[3]) if len(parts) > 3 else 1
+            hours = int(parts[4]) if len(parts) > 4 else 0
+            code = secrets.token_urlsafe(9)
+            await db.create_invite(code, admin_id, max_uses=max_uses,
+                                   expires_in_h=hours)
+            uname = await _bot_username(ctx)
+            inv = await db.get_invite(code)
+            await _safe_edit_q(q, await adm.invite_detail_text(inv, uname),
+                               adm.invite_created_kb(
+                                   adm.invite_link(uname, code), code))
+            return
+
+        if sub == "list":
+            invites = await db.list_invites()
+            live = [i for i in invites if db.invite_state(i) == "ok"]
+            if not live:
+                await _safe_edit_q(
+                    q, "📋 <b>No active invite links.</b>\n\n"
+                       "<i>Create one from the invite menu.</i>",
+                    adm.invite_menu_kb())
+                return
+            await _safe_edit_q(
+                q, f"📋 <b>Active invite links</b> — {len(live)}\n\n"
+                   "<i>Tap one to see or revoke it.</i>",
+                adm.invite_list_kb(live))
+            return
+
+        if sub == "show":
+            code = ":".join(parts[3:])
+            inv = await db.get_invite(code)
+            if not inv:
+                await q.answer("Link not found", show_alert=True)
+                return
+            uname = await _bot_username(ctx)
+            await _safe_edit_q(q, await adm.invite_detail_text(inv, uname),
+                               adm.invite_created_kb(
+                                   adm.invite_link(uname, code), code))
+            return
+
+        if sub == "rv":
+            code = ":".join(parts[3:])
+            await db.revoke_invite(code)
+            await q.answer("Link revoked")
+            await _safe_edit_q(q, await adm.invite_menu_text(),
+                               adm.invite_menu_kb())
+            return
+
+        if sub == "byid":
+            PENDING_INPUT[admin_id] = {"kind": "adduser"}
+            await _safe_edit_q(
+                q,
+                "🆔 <b>Add a user by Telegram ID</b>\n\n"
+                "Send the numeric ID now — for example <code>123456789</code>.\n"
+                "You can send several at once, separated by spaces or commas.\n\n"
+                "<i>They can find their ID via @userinfobot. "
+                "/cancel to abort.</i>")
+            return
 
     # ----- access mode -----
     if action == "mode":
@@ -1042,6 +1176,56 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
             f"✅ Key <b>{html.escape(label)}</b> added.\n\n"
             f"Pool is now <b>{n}</b> key(s) → <b>{n}</b> user(s) can chat "
             f"simultaneously.")
+        return True
+
+    if kind == "adduser":
+        raw = text.replace(",", " ").split()
+        ids = []
+        for tok in raw:
+            tok = tok.strip().lstrip("@")
+            if tok.isdigit():
+                ids.append(int(tok))
+        if not ids:
+            await update.message.reply_html(
+                "❌ No valid numeric IDs found.\n"
+                "<i>Send digits only, e.g. <code>123456789</code>.</i>")
+            return True
+
+        added, already, failed = [], [], []
+        for tid in ids:
+            existing = await db.get_user(tid)
+            if existing and existing.get("status") == db.ACTIVE:
+                already.append(tid)
+                continue
+            await db.upsert_user(tid, status=db.ACTIVE)
+            await db.set_user_status(tid, db.ACTIVE)
+            if tid in USERS:
+                USERS[tid]["status"] = db.ACTIVE
+            PENDING_NOTIFIED.pop(tid, None)
+            added.append(tid)
+            try:
+                await ctx.bot.send_message(
+                    chat_id=tid,
+                    text=("🎉 <b>You've been given access to this bot!</b>\n\n"
+                          "Send /start to open the menu and begin chatting."),
+                    parse_mode="HTML")
+            except Exception:
+                # They must message the bot first before it can DM them
+                failed.append(tid)
+
+        lines = []
+        if added:
+            lines.append(f"✅ Approved <b>{len(added)}</b> user(s): "
+                         + ", ".join(f"<code>{i}</code>" for i in added))
+        if already:
+            lines.append(f"ℹ️ Already active: "
+                         + ", ".join(f"<code>{i}</code>" for i in already))
+        if failed:
+            lines.append(
+                f"\n⚠️ Could not notify {', '.join(str(i) for i in failed)} — "
+                "Telegram only lets the bot message people who have opened it "
+                "at least once. They're approved; ask them to press /start.")
+        await update.message.reply_html("\n".join(lines))
         return True
 
     if kind == "dm":

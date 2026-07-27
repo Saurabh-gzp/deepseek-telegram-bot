@@ -165,11 +165,59 @@ class DeepSeekClient:
         return r.status_code == 200
 
     # ---------- File upload ----------
+    # Terminal statuses returned by /file/fetch_files. Anything not in this set
+    # means DeepSeek is still working on the file, so we keep polling.
+    _TERMINAL_OK = {'SUCCESS'}
+    _TERMINAL_FAIL = {
+        'FAILED',
+        'CONTENT_EMPTY',    # image/PDF parsed but no text could be extracted (OCR found nothing)
+        'CONTENT_TOO_LONG',
+        'UNSUPPORTED',
+        'AUDIT_FAILED',     # content moderation rejected the file
+        'AUDIT_BLOCKED',
+        'PARSE_FAILED',
+        'EXPIRED',
+    }
+
+    # Human-readable reasons surfaced to the bot UI
+    _FAIL_REASON = {
+        'CONTENT_EMPTY':
+            "DeepSeek is image se koi text nahi nikaal paaya.\n"
+            "DeepSeek ka file upload sirf OCR karta hai — photo me saaf padhne "
+            "layak likhaai honi chahiye. Blank / pure-graphic images kaam nahi karengi.",
+        'CONTENT_TOO_LONG': "File bahut badi hai — DeepSeek ki limit se zyada content hai.",
+        'UNSUPPORTED': "Is file format ko DeepSeek support nahi karta.",
+        'AUDIT_FAILED': "DeepSeek ke content moderation ne is file ko reject kar diya.",
+        'AUDIT_BLOCKED': "DeepSeek ke content moderation ne is file ko block kar diya.",
+        'PARSE_FAILED': "DeepSeek is file ko parse nahi kar paaya (file corrupt ho sakti hai).",
+        'FAILED': "DeepSeek par file processing fail ho gayi.",
+        'EXPIRED': "File upload expire ho gaya, dobara bhejo.",
+        'TIMEOUT': "DeepSeek ne time pe file parse nahi ki. Thodi der baad try karo.",
+        'UPLOAD_HTTP': "Upload request reject ho gayi (DeepSeek server ne error diya).",
+        'POW': "Security challenge (PoW) solve nahi hua. Node.js check karo.",
+    }
+
     def upload_file(self, file_path: str, mime_type: str = None,
-                    wait_for_ready: bool = True, poll_timeout: float = 60.0
+                    wait_for_ready: bool = True, poll_timeout: float = 90.0
                     ) -> Tuple[Optional[str], Optional[str]]:
         """
         Upload file to DeepSeek. Returns (file_id, file_name).
+
+        Thin wrapper kept for backwards compatibility — see upload_file_ex()
+        which also returns the failure reason.
+        """
+        fid, fname, _reason = self.upload_file_ex(
+            file_path, mime_type=mime_type,
+            wait_for_ready=wait_for_ready, poll_timeout=poll_timeout)
+        return fid, fname
+
+    def upload_file_ex(self, file_path: str, mime_type: str = None,
+                       wait_for_ready: bool = True, poll_timeout: float = 90.0
+                       ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Upload file to DeepSeek. Returns (file_id, file_name, error_reason).
+
+        error_reason is None on success, otherwise a human-readable string.
 
         DeepSeek requires:
           - multipart field name = "text" (not "file")
@@ -177,7 +225,7 @@ class DeepSeekClient:
         """
         pow_resp = self._pow_header('/api/v0/file/upload_file')
         if not pow_resp:
-            return None, None
+            return None, None, self._FAIL_REASON['POW']
         h = self.headers.copy()
         h['x-ds-pow-response'] = pow_resp
         h.pop('Content-Type', None)
@@ -202,24 +250,34 @@ class DeepSeekClient:
             r = requests.post(f"{self.BASE}/file/upload_file",
                               headers=h, files=files, timeout=120)
             if r.status_code != 200:
-                return None, None
+                return None, None, (
+                    f"{self._FAIL_REASON['UPLOAD_HTTP']} (HTTP {r.status_code})")
             body = r.json()
             biz = body.get('data', {}).get('biz_data')
             if not biz:
-                return None, None
+                msg = body.get('msg') or body.get('data', {}).get('biz_msg') or ''
+                return None, None, (
+                    self._FAIL_REASON['UPLOAD_HTTP'] + (f" — {msg}" if msg else ""))
             fid = biz.get('id')
             fname = biz.get('file_name')
 
         if not fid:
-            return None, None
+            return None, None, self._FAIL_REASON['UPLOAD_HTTP']
         if not wait_for_ready:
-            return fid, fname
+            return fid, fname, None
 
-        # Poll status until SUCCESS or FAILED
+        # ---- Poll until we hit a TERMINAL status ----
+        # BUGFIX: the old loop only stopped on SUCCESS/FAILED, so statuses like
+        # CONTENT_EMPTY (very common for images with no readable text) spun the
+        # loop for the full timeout and then returned None with no explanation.
         status = biz.get('status')
         deadline = _time.time() + poll_timeout
-        while status not in ('SUCCESS', 'FAILED') and _time.time() < deadline:
-            _time.sleep(0.5)
+        delay = 0.5
+        while (status not in self._TERMINAL_OK
+               and status not in self._TERMINAL_FAIL
+               and _time.time() < deadline):
+            _time.sleep(delay)
+            delay = min(delay * 1.3, 3.0)   # gentle backoff, avoids hammering
             try:
                 rs = requests.get(f"{self.BASE}/file/fetch_files",
                                   headers=self.headers,
@@ -229,12 +287,17 @@ class DeepSeekClient:
                     if files_arr:
                         status = files_arr[0].get('status')
             except Exception:
-                break
+                # transient network hiccup — keep trying until the deadline
+                continue
 
-        if status != 'SUCCESS':
-            # Failed / timed out — still return id but caller can decide
-            return None, None
-        return fid, fname
+        if status in self._TERMINAL_OK:
+            return fid, fname, None
+
+        if status in self._TERMINAL_FAIL:
+            return None, None, self._FAIL_REASON.get(
+                status, f"DeepSeek ne file reject ki (status: {status}).")
+
+        return None, None, self._FAIL_REASON['TIMEOUT']
 
     def get_file_status(self, file_id: str) -> Optional[dict]:
         try:

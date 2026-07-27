@@ -662,15 +662,28 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(
             f"⏳ Uploading '{html.escape(file_name)}'…\n"
             f"<i>Parse ho raha hai, thoda ruko…</i>", parse_mode="HTML")
-        fid, fname = await asyncio.to_thread(ds.upload_file, tmp_path)
+        fid, fname, err = await asyncio.to_thread(ds.upload_file_ex, tmp_path)
     finally:
         try: os.unlink(tmp_path)
         except: pass
 
     if not fid:
+        is_photo = bool(msg.photo)
+        tip = (
+            "\n\n<b>💡 Photo bhejne ke liye:</b>\n"
+            "• DeepSeek photo ko <b>sirf OCR</b> karta hai — usme saaf "
+            "padhne layak <b>text</b> hona chahiye\n"
+            "• Screenshot, document scan, notes, bill — ye chalega ✅\n"
+            "• Selfie, scenery, meme, logo — ye nahi chalega ❌\n"
+            "• Photo ko <b>Document/File</b> ki tarah bhejo (compress mat "
+            "hone do) — quality better rehti hai"
+        ) if is_photo else (
+            "\n\n<i>💡 txt / pdf / docx / csv best chalte hain. "
+            "Scanned PDF me text layer hona chahiye.</i>"
+        )
         await status.edit_text(
-            "❌ Upload failed or file couldn't be parsed by DeepSeek.\n"
-            "<i>Try a different format (txt/pdf/jpg/png).</i>",
+            f"❌ <b>Upload nahi ho paaya</b>\n\n"
+            f"{html.escape(err or 'Unknown error')}{tip}",
             parse_mode="HTML")
         return
 

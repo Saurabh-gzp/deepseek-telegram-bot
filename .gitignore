@@ -35,3 +35,7 @@ Thumbs.db
 
 # User uploads
 uploads/
+
+# Runtime data
+history.json
+.last_boot_notice

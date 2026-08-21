@@ -315,6 +315,9 @@ class Waiter:
         self._tick = 0
         self.stopped = False
 
+    def update_label(self, new_label: str):
+        self.label = new_label
+
     async def start(self):
         self._t0 = time.monotonic()
         self._task = asyncio.create_task(self._loop())

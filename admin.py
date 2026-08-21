@@ -1,9 +1,9 @@
 """
 admin.py — owner-only control panel.
 
-Covers: user management (approve / block / unblock / list), DeepSeek key pool
-management (add / list / remove), global stats, broadcast, and read-only
-inspection of any single user's DeepSeek conversation.
+Covers: user management (approve / block / unblock / list), DeepSeek account pool
+management (add via email/pass or token / list / remove / refresh), global stats,
+broadcast, and read-only inspection of any single user's DeepSeek conversation.
 
 Everything here is gated by is_admin() in bot.py before dispatch.
 """
@@ -23,12 +23,9 @@ log = logging.getLogger("admin")
 
 PAGE = 6
 
-# Telegram allows roughly 30 messages/second to different chats. We stay well
-# under it: bursts of BROADCAST_BATCH then a pause, plus a small per-message
-# delay. RetryAfter is always obeyed.
-BROADCAST_RATE = 20          # messages per second (ceiling)
-BROADCAST_BATCH = 20         # pause after this many
-BROADCAST_PAUSE = 1.2        # seconds between batches
+BROADCAST_RATE = 20
+BROADCAST_BATCH = 20
+BROADCAST_PAUSE = 1.2
 
 
 # --------------------------------------------------------------------------
@@ -40,7 +37,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Users", callback_data="adm:users:active:0"),
          InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
         [InlineKeyboardButton("➕ Invite a user", callback_data="adm:inv:menu")],
-        [InlineKeyboardButton("🔑 DeepSeek keys", callback_data="adm:keys"),
+        [InlineKeyboardButton("🔑 DeepSeek Accounts", callback_data="adm:accounts"),
          InlineKeyboardButton("📣 Broadcast", callback_data="adm:bc:ask")],
         [InlineKeyboardButton("🚪 Access mode", callback_data="adm:mode")],
         [InlineKeyboardButton("🔙 Back to bot", callback_data="cmd:refresh")],
@@ -186,14 +183,39 @@ def user_detail_kb(uid: int, status: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def keys_kb(tokens: List[dict]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(
-        f"{'🟢' if t.get('healthy', True) else '🔴'} {t['label']} · "
-        f"{t.get('uses', 0)} uses",
-        callback_data=f"adm:key:{t['label']}")] for t in tokens]
-    rows.append([InlineKeyboardButton("➕ Add key", callback_data="adm:key:add")])
+# New enhanced accounts keyboard
+def accounts_kb(tokens: List[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for t in tokens:
+        email = t.get("email", "")
+        atype = t.get("auth_type", "token")
+        dot = "🟢" if t.get("healthy", True) else "🔴"
+        if email and atype == "email":
+            label = f"{dot} {t['label']} · {email[:20]} · {t.get('uses', 0)} uses"
+        else:
+            label = f"{dot} {t['label']} · {t.get('uses', 0)} uses"
+        rows.append([InlineKeyboardButton(label, callback_data=f"adm:acc:{t['label']}")])
+    rows.append([InlineKeyboardButton("➕ Add Email Account", callback_data="adm:acc:add_email")])
+    rows.append([InlineKeyboardButton("➕ Add Token (manual)", callback_data="adm:key:add")])
+    rows.append([
+        InlineKeyboardButton("🔄 Refresh All", callback_data="adm:acc:refresh_all"),
+        InlineKeyboardButton("📊 Pool Status", callback_data="adm:acc:pool")
+    ])
     rows.append([InlineKeyboardButton("🔙 Admin menu", callback_data="adm:menu")])
     return InlineKeyboardMarkup(rows)
+
+
+def account_detail_kb(label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh Token", callback_data=f"adm:acc:refresh:{label}")],
+        [InlineKeyboardButton("🗑 Delete Account", callback_data=f"adm:acc:del:{label}")],
+        [InlineKeyboardButton("🔙 Accounts", callback_data="adm:accounts")],
+    ])
+
+
+# Keep old keys_kb for backward compatibility alias
+def keys_kb(tokens: List[dict]) -> InlineKeyboardMarkup:
+    return accounts_kb(tokens)
 
 
 # --------------------------------------------------------------------------
@@ -205,6 +227,9 @@ async def stats_text() -> str:
     cfg = await db.get_config()
     mode = "🌍 Open to everyone" if cfg["access_mode"] == db.MODE_OPEN \
         else "🔒 Invite only"
+    # pool info
+    tokens = await db.list_tokens()
+    healthy = len([t for t in tokens if t.get("healthy", True)])
     return (
         "📊 <b>Bot statistics</b>\n\n"
         f"<b>Users</b>\n"
@@ -217,31 +242,129 @@ async def stats_text() -> str:
         f"• Characters in: <b>{s['chars_in']:,}</b>\n"
         f"• Characters out: <b>{s['chars_out']:,}</b>\n"
         f"• Turns stored right now: <b>{s['turns_stored']:,}</b>\n\n"
-        f"<b>Capacity</b>\n"
-        f"• DeepSeek keys: <b>{POOL.size}</b> "
-        f"(<b>{POOL.free_count}</b> free, <b>{POOL.busy_count}</b> in use)\n"
-        f"• Simultaneous users supported: <b>{POOL.size or 0}</b>\n\n"
+        f"<b>Capacity (DeepSeek Accounts)</b>\n"
+        f"• Total accounts: <b>{len(tokens)}</b> (healthy: <b>{healthy}</b>)\n"
+        f"• Pool size: <b>{POOL.size}</b> "
+        f"(<b>{POOL.free_count}</b> free, <b>{POOL.busy_count}</b> busy, <b>{POOL.waiting_count}</b> queued)\n"
+        f"• Simultaneous users supported: <b>{POOL.size or 0}</b>\n"
+        f"• 1 account = 1 concurrent user. Queue = line-by-line FIFO.\n\n"
         f"<b>Access:</b> {mode}"
     )
 
 
-async def keys_text() -> str:
+async def accounts_text() -> str:
     tokens = await db.list_tokens()
     if not tokens:
-        return ("🔑 <b>DeepSeek keys</b>\n\n"
-                "<i>No keys yet. Add one — each key lets one more person use "
-                "the bot at the same time.</i>")
-    lines = ["🔑 <b>DeepSeek keys</b>\n"]
+        return (
+            "🔑 <b>DeepSeek Accounts</b>\n\n"
+            "<i>No accounts yet.</i>\n\n"
+            "• <b>➕ Add Email Account</b> → email + password bhejo, token auto-generate hoga aur expire pe auto-refresh bhi.\n"
+            "• <b>➕ Add Token</b> → manual token (old method).\n\n"
+            "Har account = 1 simultaneous user. 2 accounts = 2 log ek sath chat kar sakte hain. 10 accounts = 10 log ek sath.\n"
+            "Jab saare busy honge to baki users ko <i>⏳ Analysing your request...</i> dikhega aur turn-by-turn line me handle hoga."
+        )
+    lines = ["🔑 <b>DeepSeek Accounts — Pool Status</b>\n"]
+    lines.append(f"Pool: <b>{POOL.size}</b> total, <b>{POOL.free_count}</b> free, <b>{POOL.busy_count}</b> busy, <b>{POOL.waiting_count}</b> waiting\n")
+    # busy map
+    bm = POOL.busy_map()
+    if bm:
+        lines.append("<b>Busy:</b>")
+        for lab, uid in bm.items():
+            lines.append(f"  • <code>{html.escape(lab)}</code> → user <code>{uid}</code>")
+        lines.append("")
     for t in tokens:
         dot = "🟢" if t.get("healthy", True) else "🔴"
-        lines.append(f"{dot} <b>{html.escape(t['label'])}</b> — "
-                     f"{t.get('uses', 0)} uses")
-        if t.get("last_error"):
-            lines.append(f"   <i>{html.escape(t['last_error'][:80])}</i>")
-    lines.append(f"\n<b>{len(tokens)}</b> key(s) → <b>{len(tokens)}</b> "
-                 f"user(s) can talk to DeepSeek at once.")
-    lines.append(f"Currently free: <b>{POOL.free_count}</b>")
+        label = t['label']
+        uses = t.get('uses', 0)
+        email = t.get("email", "")
+        atype = t.get("auth_type", "token")
+        last_err = t.get("last_error", "")
+        # token preview
+        tok = t.get("token", "")
+        tok_prev = (tok[:10] + "…") if len(tok) > 12 else tok
+        if atype == "email" and email:
+            lines.append(f"{dot} <b>{html.escape(label)}</b> — 📧 <code>{html.escape(email)}</code> — {uses} uses — <code>{html.escape(tok_prev)}</code>")
+        else:
+            lines.append(f"{dot} <b>{html.escape(label)}</b> — 🔑 <code>{html.escape(tok_prev)}</code> — {uses} uses")
+        if last_err:
+            lines.append(f"   <i>⚠️ {html.escape(last_err[:90])}</i>")
+        # last check time
+        lc = t.get("last_check", 0)
+        if lc:
+            lines.append(f"   <i>last check: {time.strftime('%Y-%m-%d %H:%M', time.localtime(lc))}</i>")
+    lines.append(f"\n<b>{len(tokens)}</b> account(s) → <b>{len(tokens)}</b> simultaneous user(s).")
+    lines.append("Tap an account to manage (refresh/delete).")
     return "\n".join(lines)
+
+
+async def keys_text() -> str:
+    # alias for backward compatibility
+    return await accounts_text()
+
+
+async def account_detail_text(label: str) -> str:
+    doc = await db.get_token_doc(label)
+    if not doc:
+        return f"❌ Account <b>{html.escape(label)}</b> not found."
+    dot = "🟢 Healthy" if doc.get("healthy", True) else "🔴 Unhealthy"
+    email = doc.get("email", "")
+    atype = doc.get("auth_type", "token")
+    uses = doc.get("uses", 0)
+    added = time.strftime("%Y-%m-%d %H:%M", time.localtime(doc.get("added_at", 0)))
+    last_check = doc.get("last_check", 0)
+    last_login = doc.get("last_login", 0)
+    tok = doc.get("token", "")
+    tok_prev = (tok[:16] + "..." + tok[-6:]) if len(tok) > 22 else tok
+    last_err = doc.get("last_error", "") or "—"
+    # busy?
+    bm = POOL.busy_map()
+    busy = bm.get(label)
+    busy_txt = f"⏳ Busy with user <code>{busy}</code>" if busy else "💤 Free"
+    lines = [
+        f"🔑 <b>Account: {html.escape(label)}</b>\n",
+        f"• Status: <b>{dot}</b> — {busy_txt}",
+        f"• Type: <b>{html.escape(atype)}</b>",
+    ]
+    if email:
+        lines.append(f"• Email: <code>{html.escape(email)}</code>")
+        # mask password
+        pwd = doc.get("password", "")
+        if pwd:
+            masked = pwd[:2] + "•"*max(3, len(pwd)-4) + pwd[-2:] if len(pwd)>4 else "•"*len(pwd)
+            lines.append(f"• Password: <code>{html.escape(masked)}</code> (stored)")
+    lines.append(f"• Token: <code>{html.escape(tok_prev)}</code> ({len(tok)} chars)")
+    lines.append(f"• Uses: <b>{uses}</b>")
+    lines.append(f"• Added: {added}")
+    if last_login:
+        lines.append(f"• Last login/refresh: {time.strftime('%Y-%m-%d %H:%M', time.localtime(last_login))}")
+    if last_check:
+        lines.append(f"• Last health check: {time.strftime('%Y-%m-%d %H:%M', time.localtime(last_check))}")
+    lines.append(f"• Last error: <i>{html.escape(last_err[:200])}</i>")
+    lines.append("")
+    if atype == "email" and email:
+        lines.append("✅ Auto-refresh enabled (email/pass se token expire pe auto-renew hoga).")
+    else:
+        lines.append("⚠️ Manual token — expire pe aapko manually refresh karna hoga ya email/pass add karo.")
+    lines.append("\n<i>Use buttons below to refresh or delete.</i>")
+    return "\n".join(lines)
+
+
+async def pool_status_text() -> str:
+    tokens = await db.list_tokens()
+    healthy = [t for t in tokens if t.get("healthy", True)]
+    return (
+        "📊 <b>Pool Status — Live</b>\n\n"
+        f"• Total accounts (DB): <b>{len(tokens)}</b>\n"
+        f"• Healthy: <b>{len(healthy)}</b>  • Unhealthy: <b>{len(tokens)-len(healthy)}</b>\n"
+        f"• Pool size (active): <b>{POOL.size}</b>\n"
+        f"• Free: <b>{POOL.free_count}</b>  • Busy: <b>{POOL.busy_count}</b>  • Queued: <b>{POOL.waiting_count}</b>\n\n"
+        f"<b>How queuing works:</b>\n"
+        f"• {POOL.size} accounts = {POOL.size} users ek sath response pa sakte hain.\n"
+        f"• Usse zyada users ne bheja to sabko <i>⏳ Analysing your request ...</i> dikhega.\n"
+        f"• Har user ka request line-by-line FIFO queue me jayega.\n"
+        f"• Jaise hi koi account free hoga, next queued user ka answer start hoga.\n\n"
+        f"Busy map: <code>{html.escape(str(POOL.busy_map()))}</code>"
+    )
 
 
 async def user_detail_text(uid: int) -> Tuple[str, str]:
@@ -301,12 +424,6 @@ async def user_chat_text(uid: int, page: int = 0,
 
 async def broadcast(bot, text: str, sender_id: int,
                     progress_cb=None) -> dict:
-    """
-    Send `text` to every active user, respecting Telegram's rate limits.
-
-    Users who blocked the bot are automatically marked blocked in the DB so
-    the next broadcast skips them.
-    """
     ids = await db.all_active_ids()
     ids = [i for i in ids if i != sender_id]
     stats = {"total": len(ids), "sent": 0, "failed": 0, "blocked": 0}
@@ -329,7 +446,6 @@ async def broadcast(bot, text: str, sender_id: int,
             except Exception:
                 stats["failed"] += 1
         except Forbidden:
-            # user blocked the bot / deleted the chat
             stats["blocked"] += 1
             await db.set_user_status(uid, db.BLOCKED)
         except (BadRequest, TimedOut, NetworkError):

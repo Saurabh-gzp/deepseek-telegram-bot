@@ -1,27 +1,25 @@
 """
-token_pool.py — DeepSeek key pool with hard concurrency control.
+token_pool.py — DeepSeek key pool with hard concurrency control + email/pass auto-refresh.
 
-The rule the pool enforces: one DeepSeek key can serve exactly one request at
-a time. So N keys == N users talking to DeepSeek simultaneously; with 1 key
-the bot answers one person at a time and everyone else waits in line.
+The rule the pool enforces: one DeepSeek account/key can serve exactly one request at
+a time. So N accounts == N users talking to DeepSeek simultaneously; with 1 account
+the bot answers one person at a time and everyone else waits in line with an animated
+"Analysing your request" loader.
 
-    async with POOL.acquire(uid) as lease:
-        if lease is None:
-            ...  # pool is empty (no keys configured)
-        for ev in lease.client.chat_stream(...):
-            ...
-
-Leases are strictly scoped: the client object handed out is bound to one key
-and returned to the pool the moment the block exits, even on exception.
+New in this version:
+  • Each account can be stored as email+password. Token is auto-refreshed when it expires.
+  • Health checks + auto-refresh on failure.
+  • Waiting queue tracking for UI (queue position).
+  • Admin notifications on account failure.
 """
 import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import db
-from deepseek_client import DeepSeekClient
+from deepseek_client import DeepSeekClient, login_with_credentials, validate_token
 
 log = logging.getLogger("pool")
 
@@ -29,10 +27,11 @@ log = logging.getLogger("pool")
 class Lease:
     """A single checked-out key plus its ready-to-use client."""
 
-    def __init__(self, label: str, token: str, client: DeepSeekClient):
+    def __init__(self, label: str, token: str, client: DeepSeekClient, email: str = ""):
         self.label = label
         self.token = token
         self.client = client
+        self.email = email
         self.acquired_at = time.monotonic()
 
 
@@ -43,7 +42,11 @@ class TokenPool:
         self._free: Optional[asyncio.Queue] = None      # queue of labels
         self._labels: List[str] = []
         self._tokens: Dict[str, str] = {}               # label -> token
+        self._emails: Dict[str, str] = {}               # label -> email
+        self._passwords: Dict[str, str] = {}            # label -> password
+        self._auth_types: Dict[str, str] = {}          # label -> auth_type
         self._busy: Dict[str, int] = {}                 # label -> uid
+        self._waiters: int = 0
         self._lock = asyncio.Lock()
 
     # ---------- lifecycle ----------
@@ -56,6 +59,9 @@ class TokenPool:
 
             self._labels = [r["label"] for r in healthy]
             self._tokens = {r["label"]: r["token"] for r in healthy}
+            self._emails = {r["label"]: r.get("email", "") for r in healthy}
+            self._passwords = {r["label"]: r.get("password", "") for r in healthy}
+            self._auth_types = {r["label"]: r.get("auth_type", "token") for r in healthy}
 
             # keep existing clients so we don't re-download the WASM each time
             for label in list(self._clients):
@@ -64,8 +70,7 @@ class TokenPool:
             for label, token in self._tokens.items():
                 existing = self._clients.get(label)
                 if existing is None or existing.token != token:
-                    self._clients[label] = DeepSeekClient(token,
-                                                          workdir=self.workdir)
+                    self._clients[label] = DeepSeekClient(token, workdir=self.workdir)
 
             q: asyncio.Queue = asyncio.Queue()
             for label in self._labels:
@@ -91,10 +96,137 @@ class TokenPool:
     def busy_count(self) -> int:
         return len(self._busy)
 
+    @property
+    def waiting_count(self) -> int:
+        return self._waiters
+
     def busy_map(self) -> Dict[str, int]:
         return dict(self._busy)
 
-    # ---------- leasing ----------
+    def get_account_info(self, label: str) -> Dict[str, str]:
+        return {
+            "label": label,
+            "token": self._tokens.get(label, ""),
+            "email": self._emails.get(label, ""),
+            "auth_type": self._auth_types.get(label, "token"),
+        }
+
+    # ---------- refresh logic ----------
+
+    async def refresh_account(self, label: str) -> Tuple[bool, str]:
+        """
+        Try to refresh token for account with email/password.
+        Returns (success, message).
+        """
+        doc = await db.get_token_doc(label)
+        if not doc:
+            return False, "Account not found"
+        email = doc.get("email", "")
+        password = doc.get("password", "")
+        auth_type = doc.get("auth_type", "token")
+        if auth_type != "email" or not email or not password:
+            return False, "No email/password stored — add email/pass to enable auto-refresh"
+        # Try login
+        try:
+            new_token = await asyncio.to_thread(login_with_credentials, email, password)
+        except Exception as e:
+            return False, f"Login exception: {e}"
+        if not new_token:
+            await db.mark_token(label, healthy=False, error="Login failed — check email/password")
+            return False, "Login failed — wrong email/password or DeepSeek blocked"
+        ok = await db.update_account_token(label, new_token)
+        if ok:
+            # update in-memory
+            self._tokens[label] = new_token
+            # recreate client
+            self._clients[label] = DeepSeekClient(new_token, workdir=self.workdir)
+            await db.set_token_last_check(label, healthy=True)
+            log.info("Refreshed token for %s (%s)", label, email)
+            return True, "Token refreshed successfully"
+        return False, "DB update failed"
+
+    async def health_check_all(self, notify_callback=None) -> Dict[str, any]:
+        """
+        Check all accounts health. For email accounts, try refresh if token invalid.
+        notify_callback(label, email, error) will be called on failure if provided.
+        """
+        rows = await db.list_tokens()
+        results = {"total": len(rows), "healthy": 0, "refreshed": 0, "failed": 0, "errors": []}
+        for r in rows:
+            label = r["label"]
+            token = r["token"]
+            email = r.get("email", "")
+            auth_type = r.get("auth_type", "token")
+            healthy = r.get("healthy", True)
+            # Skip already known unhealthy? Still try to refresh email accounts
+            is_valid = await asyncio.to_thread(validate_token, token, self.workdir)
+            if is_valid:
+                if not healthy:
+                    await db.mark_token(label, healthy=True, error="")
+                await db.set_token_last_check(label, healthy=True)
+                results["healthy"] += 1
+            else:
+                # Token invalid
+                if auth_type == "email" and email:
+                    # try refresh
+                    success, msg = await self.refresh_account(label)
+                    if success:
+                        results["refreshed"] += 1
+                        results["healthy"] += 1
+                    else:
+                        results["failed"] += 1
+                        results["errors"].append(f"{label} ({email}): {msg}")
+                        if notify_callback:
+                            try:
+                                await notify_callback(label, email, msg)
+                            except: pass
+                else:
+                    await db.mark_token(label, healthy=False, error="Token expired — no email/pass for auto-refresh")
+                    results["failed"] += 1
+                    results["errors"].append(f"{label}: Token expired — no auto-refresh")
+                    if notify_callback:
+                        try:
+                            await notify_callback(label, email or "token", "Token expired — no email/pass")
+                        except: pass
+        # reload pool to reflect health changes
+        await self.reload()
+        return results
+
+    async def report_failure(self, label: str, error: str, notify_callback=None) -> bool:
+        """
+        Called when a DeepSeek request fails on a specific account.
+        Detects auth errors and tries auto-refresh. Returns True if refreshed.
+        """
+        low = error.lower()
+        is_auth = any(x in low for x in ["401", "403", "unauthorized", "authentication", "token", "expired", "session", "login"])
+        if not is_auth:
+            await db.mark_token(label, healthy=True, error=error[:200])
+            return False
+        # Try refresh if email account
+        doc = await db.get_token_doc(label)
+        if not doc:
+            return False
+        if doc.get("auth_type") == "email" and doc.get("email"):
+            success, msg = await self.refresh_account(label)
+            if success:
+                log.info("Auto-refreshed %s after auth error", label)
+                return True
+            else:
+                await db.mark_token(label, healthy=False, error=f"Auth failed: {error[:150]} | Refresh: {msg}")
+                if notify_callback:
+                    try:
+                        await notify_callback(label, doc.get("email", ""), f"Auth error: {error[:150]} | Refresh failed: {msg}")
+                    except: pass
+                return False
+        else:
+            await db.mark_token(label, healthy=False, error=f"Auth error: {error[:150]} — no auto-refresh")
+            if notify_callback:
+                try:
+                    await notify_callback(label, "token", f"Auth error: {error[:150]}")
+                except: pass
+            return False
+
+    # ---------- leasing with queue tracking ----------
 
     @asynccontextmanager
     async def acquire(self, uid: int, timeout: Optional[float] = None):
@@ -111,6 +243,7 @@ class TokenPool:
             return
 
         label = None
+        self._waiters += 1
         try:
             if timeout is None:
                 label = await self._free.get()
@@ -119,11 +252,13 @@ class TokenPool:
         except asyncio.TimeoutError:
             yield None
             return
+        finally:
+            self._waiters = max(0, self._waiters - 1)
 
         self._busy[label] = uid
         try:
             await db.bump_token_use(label)
-            yield Lease(label, self._tokens[label], self._clients[label])
+            yield Lease(label, self._tokens[label], self._clients[label], self._emails.get(label, ""))
         finally:
             self._busy.pop(label, None)
             # only return it if the key still exists after a concurrent reload
@@ -133,6 +268,10 @@ class TokenPool:
     async def would_wait(self) -> bool:
         """True if every key is currently in use (so the caller will queue)."""
         return self.size > 0 and self.free_count == 0
+
+    async def queue_position_estimate(self) -> int:
+        """Estimate of queued users + 1 (for display)."""
+        return self._waiters + self.busy_count
 
 
 POOL = TokenPool()

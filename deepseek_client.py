@@ -7,9 +7,67 @@ import os
 import subprocess
 import time as _time
 import urllib.request
+import uuid
 from typing import Optional, Iterator, List, Tuple, Dict, Any
 
 import requests
+
+
+def login_with_credentials(email: str, password: str) -> Optional[str]:
+    """
+    Login to DeepSeek with email/password, return session token or None.
+    Uses Android API endpoint as in v5.2 terminal client.
+    """
+    url = "https://chat.deepseek.com/api/v0/users/login"
+    login_headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'DeepSeek/2.0.2 (Android; API)',
+        'Origin': 'https://chat.deepseek.com',
+        'Referer': 'https://chat.deepseek.com/'
+    }
+    data = {
+        'email': email,
+        'password': password,
+        'device_id': str(uuid.uuid4()),
+        'os': 'Android'
+    }
+    try:
+        resp = requests.post(url, headers=login_headers, json=data, timeout=20)
+        if resp.status_code == 200:
+            result = resp.json()
+            if result.get('code') == 0 and 'data' in result:
+                token = result['data'].get('biz_data', {}).get('user', {}).get('token')
+                if token:
+                    return token
+        return None
+    except Exception:
+        return None
+
+
+def validate_token(token: str, workdir: str = ".") -> bool:
+    """Quick validation: try to fetch chat list with token."""
+    try:
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'X-Client-Platform': 'web',
+            'X-Client-Version': '2.0.2',
+            'Origin': 'https://chat.deepseek.com',
+            'Referer': 'https://chat.deepseek.com/'
+        }
+        r = requests.get("https://chat.deepseek.com/api/v0/chat_session/fetch_page",
+                         headers=headers, timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            # biz_code 0 means valid
+            if j.get('code') == 0:
+                return True
+        if r.status_code in (401, 403):
+            return False
+        return False
+    except Exception:
+        return False
 
 WASM_FILENAME = "sha3_wasm_bg.7b9ca65ddd.wasm"
 JS_SOLVER_FILENAME = "pow_solver.js"

@@ -370,10 +370,56 @@ async def add_token(token: str, label: str) -> bool:
             "healthy": True,
             "uses": 0,
             "last_error": "",
+            "auth_type": "token",
+            "email": "",
+            "password": "",
+            "last_login": 0,
+            "last_check": 0,
         })
         return True
     except DuplicateKeyError:
         return False
+
+
+async def add_email_account(label: str, email: str, password: str, token: str) -> bool:
+    """Add account with email/password + token. Duplicate label -> False."""
+    try:
+        await _db.tokens.insert_one({
+            "token": token,
+            "label": label,
+            "added_at": _now(),
+            "healthy": True,
+            "uses": 0,
+            "last_error": "",
+            "auth_type": "email",
+            "email": email,
+            "password": password,
+            "last_login": _now(),
+            "last_check": _now(),
+        })
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+async def update_account_token(label: str, new_token: str) -> bool:
+    r = await _db.tokens.update_one(
+        {"label": label},
+        {"$set": {"token": new_token, "healthy": True, "last_error": "", "last_login": _now(), "last_check": _now()}}
+    )
+    return r.matched_count > 0
+
+
+async def set_account_credentials(label: str, email: str, password: str) -> bool:
+    r = await _db.tokens.update_one(
+        {"label": label},
+        {"$set": {"email": email, "password": password, "auth_type": "email"}}
+    )
+    return r.matched_count > 0
+
+
+async def get_token_doc(label: str) -> Optional[Dict[str, Any]]:
+    return await _db.tokens.find_one({"label": label})
 
 
 async def remove_token(label: str) -> bool:
@@ -389,11 +435,15 @@ async def list_tokens() -> List[Dict[str, Any]]:
 async def mark_token(label: str, *, healthy: bool, error: str = "") -> None:
     await _db.tokens.update_one(
         {"label": label},
-        {"$set": {"healthy": healthy, "last_error": error[:300]}})
+        {"$set": {"healthy": healthy, "last_error": error[:300], "last_check": _now()}})
 
 
 async def bump_token_use(label: str) -> None:
     await _db.tokens.update_one({"label": label}, {"$inc": {"uses": 1}})
+
+
+async def set_token_last_check(label: str, healthy: bool = True) -> None:
+    await _db.tokens.update_one({"label": label}, {"$set": {"last_check": _now(), "healthy": healthy}})
 
 
 # --------------------------------------------------------------------------

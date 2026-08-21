@@ -42,7 +42,7 @@ from telegram.ext import (
     ContextTypes, filters,
 )
 
-from deepseek_client import DeepSeekClient, RULES
+from deepseek_client import DeepSeekClient, RULES, login_with_credentials
 from md2tg import md_to_tg_html, strip_incomplete_markers, safe_for_telegram
 from personas import PERSONAS, get_persona, wrap_prompt
 from progress import Progress, Waiter
@@ -225,6 +225,61 @@ def is_admin(uid: int) -> bool:
 
 def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
+
+
+async def notify_owner(bot, text: str):
+    """Notify owner about account failures — fire-and-forget."""
+    try:
+        await bot.send_message(chat_id=OWNER_ID, text=text, parse_mode="HTML", disable_notification=False)
+    except Exception as e:
+        log.warning("notify_owner failed: %s", e)
+
+
+def _parse_email_account_input(text: str):
+    """
+    Parse admin input for email account.
+    Supports:
+      email password
+      email:password
+      label email password
+      label=email=password
+    Returns (label, email, password) or (None, None, None) on failure.
+    """
+    import re
+    raw = text.strip()
+    # Normalize separators: = -> space, : -> space, , -> space
+    # But keep email's @ and dots
+    # First try split by whitespace
+    parts = re.split(r'[\s,]+', raw)
+    # Remove empty
+    parts = [p.strip().strip('=:\'"') for p in parts if p.strip()]
+    if len(parts) == 2:
+        email, password = parts
+        if "@" in email and len(password) >= 3:
+            label = email.split("@")[0][:16] + "_" + str(int(time.time()) % 10000)
+            label = re.sub(r'[^a-zA-Z0-9_]', '_', label)
+            return label, email, password
+    elif len(parts) == 3:
+        label, email, password = parts
+        if "@" in email and len(password) >= 3:
+            label = re.sub(r'[^a-zA-Z0-9_\-]', '_', label)[:32]
+            return label, email, password
+    # try colon/equal parsing like "label = email = password" or "email:password"
+    # fallback: if text contains '=', split
+    if "=" in raw:
+        eq_parts = [p.strip() for p in raw.split("=")]
+        eq_parts = [p for p in eq_parts if p]
+        if len(eq_parts) == 2 and "@" in eq_parts[0]:
+            email, password = eq_parts
+            label = email.split("@")[0][:16] + "_" + str(int(time.time()) % 10000)
+            label = re.sub(r'[^a-zA-Z0-9_]', '_', label)
+            return label, email, password
+        if len(eq_parts) == 3:
+            label, email, password = eq_parts
+            if "@" in email:
+                label = re.sub(r'[^a-zA-Z0-9_\-]', '_', label)[:32]
+                return label, email, password
+    return None, None, None
 
 
 # ---------- UI ----------
@@ -1106,10 +1161,96 @@ async def handle_admin(q, ctx, data: str):
         await _safe_edit_q(q, await adm.stats_text(), adm.admin_menu_kb())
         return
 
-    # ----- keys -----
+    # ----- NEW: DeepSeek Accounts -----
+    if action in ("accounts", "keys"):
+        await _safe_edit_q(q, await adm.accounts_text(),
+                           adm.accounts_kb(await db.list_tokens()))
+        return
+
+    if action == "acc":
+        sub = parts[2] if len(parts) > 2 else ""
+        # adm:acc:add_email
+        if sub == "add_email":
+            PENDING_INPUT[admin_id] = {"kind": "add_email_account"}
+            await _safe_edit_q(
+                q,
+                "📧 <b>Add DeepSeek Email Account</b>\n\n"
+                "Send in one message:\n"
+                "<code>email password</code>\n"
+                "or <code>label email password</code>\n\n"
+                "Examples:\n"
+                "<code>user@example.com mypass123</code>\n"
+                "<code>myacc2 myemail@gmail.com mypass123</code>\n\n"
+                "Bot email se login karke token auto-fetch karega.\n"
+                "Token expire pe bot <i>auto-refresh</i> karega, aapko manual kuch nahi karna.\n\n"
+                "<b>Note:</b> 1 account = 1 simultaneous user. 10 accounts = 10 users ek sath.\n"
+                "Queue me <i>Analysing your request...</i> dikhega line-by-line.\n\n"
+                "<i>/cancel to abort.</i>")
+            return
+        if sub == "refresh_all":
+            await q.answer("Checking all accounts…")
+            try:
+                async def notify(lbl, email, err):
+                    try:
+                        await ctx.bot.send_message(chat_id=admin_id, text=f"⚠️ <b>Account failed:</b> <code>{html.escape(lbl)}</code> ({html.escape(email)})\n<i>{html.escape(err[:200])}</i>", parse_mode="HTML")
+                    except: pass
+                res = await POOL.health_check_all(notify_callback=notify)
+                txt = (f"🔄 <b>Health check done</b>\n\n"
+                       f"• Total: <b>{res['total']}</b>\n"
+                       f"• Healthy: <b>{res['healthy']}</b>\n"
+                       f"• Refreshed: <b>{res['refreshed']}</b>\n"
+                       f"• Failed: <b>{res['failed']}</b>\n")
+                if res['errors']:
+                    txt += "\n<b>Errors:</b>\n" + "\n".join(f"• {html.escape(e[:120])}" for e in res['errors'][:5])
+                await _safe_edit_q(q, txt + "\n\n" + await adm.accounts_text(), adm.accounts_kb(await db.list_tokens()))
+            except Exception as e:
+                await _safe_edit_q(q, f"❌ Health check failed: {html.escape(str(e)[:200])}", adm.accounts_kb(await db.list_tokens()))
+            return
+        if sub == "pool":
+            await _safe_edit_q(q, await adm.pool_status_text(), InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Refresh All", callback_data="adm:acc:refresh_all")],
+                [InlineKeyboardButton("🔙 Accounts", callback_data="adm:accounts")]
+            ]))
+            return
+        # adm:acc:<label> -> show detail
+        if sub and sub not in ("add_email", "refresh", "del", "refresh_all", "pool"):
+            label = ":".join(parts[2:])
+            # If label contains colon from original label, handle correctly: parts[2] is label without colon? labels don't contain colon, so ok
+            # Check if it's detail view
+            if await db.get_token_doc(label):
+                await _safe_edit_q(q, await adm.account_detail_text(label), adm.account_detail_kb(label))
+                return
+        # adm:acc:refresh:<label>
+        if sub == "refresh":
+            label = ":".join(parts[3:])
+            await q.answer("Refreshing…")
+            try:
+                success, msg = await POOL.refresh_account(label)
+                if success:
+                    await q.answer("Refreshed ✅")
+                    await _safe_edit_q(q, f"✅ <b>Refreshed:</b> <code>{html.escape(label)}</code>\n{html.escape(msg)}\n\n" + await adm.account_detail_text(label), adm.account_detail_kb(label))
+                else:
+                    await _safe_edit_q(q, f"❌ <b>Refresh failed:</b> <code>{html.escape(label)}</code>\n<i>{html.escape(msg)}</i>\n\n" + await adm.account_detail_text(label), adm.account_detail_kb(label))
+                    # notify admin
+                    try:
+                        await ctx.bot.send_message(chat_id=admin_id, text=f"⚠️ Refresh failed for <code>{html.escape(label)}</code>\n<i>{html.escape(msg)}</i>", parse_mode="HTML")
+                    except: pass
+            except Exception as e:
+                await _safe_edit_q(q, f"❌ Error: {html.escape(str(e)[:200])}", adm.account_detail_kb(label))
+            return
+        if sub == "del":
+            label = ":".join(parts[3:])
+            await db.remove_token(label)
+            n = await POOL.reload()
+            await q.answer(f"Removed · pool = {n}")
+            await _safe_edit_q(q, await adm.accounts_text(),
+                               adm.accounts_kb(await db.list_tokens()))
+            return
+
+    # ----- keys (legacy) -----
     if action == "keys":
-        await _safe_edit_q(q, await adm.keys_text(),
-                           adm.keys_kb(await db.list_tokens()))
+        await _safe_edit_q(q, await adm.accounts_text(),
+                           adm.accounts_kb(await db.list_tokens()))
         return
 
     if action == "key":
@@ -1118,17 +1259,22 @@ async def handle_admin(q, ctx, data: str):
             PENDING_INPUT[admin_id] = {"kind": "addkey"}
             await _safe_edit_q(
                 q,
-                "🔑 <b>Add a DeepSeek key</b>\n\n"
+                "🔑 <b>Add a DeepSeek key (manual token)</b>\n\n"
                 "Send it as:\n<code>label = token</code>\n\n"
                 "Example:\n<code>acct2 = abc123...</code>\n\n"
-                "<i>Each key adds one more simultaneous user. "
+                "Tip: Email account better hai — expire pe auto-refresh. Use <b>➕ Add Email Account</b> instead.\n"
+                "<i>Each key/account adds one more simultaneous user. "
                 "/cancel to abort.</i>")
             return
         label = ":".join(parts[2:])
+        # If it's actually an account label, show account detail
+        if await db.get_token_doc(label):
+            await _safe_edit_q(q, await adm.account_detail_text(label), adm.account_detail_kb(label))
+            return
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Remove this key",
-                                  callback_data=f"adm:keydel:{label}")],
-            [InlineKeyboardButton("🔙 Keys", callback_data="adm:keys")],
+                                  callback_data=f"adm:acc:del:{label}")],
+            [InlineKeyboardButton("🔙 Accounts", callback_data="adm:accounts")],
         ])
         await _safe_edit_q(q, f"🔑 <b>{html.escape(label)}</b>\n\n"
                               "<i>Removing a key reduces how many people can "
@@ -1140,8 +1286,8 @@ async def handle_admin(q, ctx, data: str):
         await db.remove_token(label)
         n = await POOL.reload()
         await q.answer(f"Removed · pool = {n}")
-        await _safe_edit_q(q, await adm.keys_text(),
-                           adm.keys_kb(await db.list_tokens()))
+        await _safe_edit_q(q, await adm.accounts_text(),
+                           adm.accounts_kb(await db.list_tokens()))
         return
 
     # ----- broadcast -----
@@ -1155,20 +1301,68 @@ async def handle_admin(q, ctx, data: str):
             "<i>/cancel to abort.</i>")
         return
 
-
 async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
     """Consume a typed admin input (key / broadcast / DM). Returns True if used."""
     uid = update.effective_user.id
-    text = (update.message.text or "").strip()
+    text_raw = (update.message.text or "").strip()
     kind = pending.get("kind")
     PENDING_INPUT.pop(uid, None)
 
+    if kind == "add_email_account":
+        label, email, password = _parse_email_account_input(text_raw)
+        if not label or not email or not password:
+            await update.message.reply_html(
+                "❌ <b>Galat format.</b>\n\n"
+                "Use: <code>email password</code> ya <code>label email password</code>\n"
+                "Example: <code>user@example.com mypass123</code>\n"
+                "Ya: <code>myacc myemail@gmail.com mypass</code>")
+            return True
+        # Check duplicate label
+        existing = await db.get_token_doc(label)
+        if existing:
+            await update.message.reply_html(f"❌ Label <b>{label}</b> already exists. Try different label.")
+            return True
+        await update.message.reply_html(f"⏳ <b>Logging in {email}...</b>\n<i>DeepSeek se token fetch kar raha hu, thoda wait...</i>")
+        try:
+            token = await asyncio.to_thread(login_with_credentials, email, password)
+        except Exception as e:
+            await update.message.reply_html(f"❌ Login exception: <code>{html.escape(str(e)[:200])}</code>")
+            return True
+        if not token:
+            await update.message.reply_html(
+                f"❌ <b>Login failed for {html.escape(email)}</b>\n"
+                "Check email/password. DeepSeek ne reject kiya.\n"
+                "<i>Tip: DeepSeek web pe manually login karke dekho ki credentials sahi hain.</i>"
+            )
+            # Notify owner about failure
+            try:
+                await ctx.bot.send_message(chat_id=OWNER_ID, text=f"⚠️ <b>Account add failed</b>\nEmail: <code>{html.escape(email)}</code>\nError: Login failed", parse_mode="HTML")
+            except: pass
+            return True
+        ok = await db.add_email_account(label, email, password, token)
+        if not ok:
+            await update.message.reply_html(f"❌ DB error — label <b>{html.escape(label)}</b> already exists.")
+            return True
+        n = await POOL.reload()
+        await update.message.reply_html(
+            f"✅ <b>Account added!</b> <code>{html.escape(label)}</code>\n"
+            f"📧 {html.escape(email)}\n"
+            f"🔑 Token: <code>{html.escape(token[:12])}…</code> ({len(token)} chars)\n\n"
+            f"Pool ab <b>{n}</b> account(s) → <b>{n}</b> users ek sath chat kar sakte hain.\n"
+            f"{'🟢 Auto-refresh enabled' if email else ''}"
+        )
+        # Send pool status
+        try:
+            await update.message.reply_html(await adm.accounts_text(), reply_markup=adm.accounts_kb(await db.list_tokens()))
+        except: pass
+        return True
+
     if kind == "addkey":
-        if "=" not in text:
+        if "=" not in text_raw:
             await update.message.reply_html(
                 "❌ Wrong format. Use <code>label = token</code>")
             return True
-        label, token = text.split("=", 1)
+        label, token = text_raw.split("=", 1)
         label, token = label.strip(), token.strip()
         if not label or not token:
             await update.message.reply_html("❌ Label and token are required.")
@@ -1186,7 +1380,7 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
         return True
 
     if kind == "adduser":
-        raw = text.replace(",", " ").split()
+        raw = text_raw.replace(",", " ").split()
         ids = []
         for tok in raw:
             tok = tok.strip().lstrip("@")
@@ -1217,7 +1411,6 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
                           "Send /start to open the menu and begin chatting."),
                     parse_mode="HTML")
             except Exception:
-                # They must message the bot first before it can DM them
                 failed.append(tid)
 
         lines = []
@@ -1240,7 +1433,7 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
         try:
             await ctx.bot.send_message(
                 chat_id=target,
-                text=f"✉️ <b>Message from admin</b>\n\n{text}",
+                text=f"✉️ <b>Message from admin</b>\n\n{text_raw}",
                 parse_mode="HTML")
             await update.message.reply_html("✅ Sent.")
         except Exception as e:
@@ -1258,7 +1451,7 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
             async def cb(done, st):
                 await p.note(f"{done} sent · {st['failed']} failed")
 
-            stats = await adm.broadcast(ctx.bot, text, uid, progress_cb=cb)
+            stats = await adm.broadcast(ctx.bot, text_raw, uid, progress_cb=cb)
         await update.message.reply_html(
             "📣 <b>Broadcast finished</b>\n\n"
             f"• Recipients: <b>{stats['total']}</b>\n"
@@ -1269,8 +1462,6 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
 
     return False
 
-
-# ---------- Voice input ----------
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await gate(update): return
     msg = update.message
@@ -1635,13 +1826,30 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
         chat_id=chat_id, text="⏳ …",
         reply_to_message_id=reply_to_msg_id,
     )
-    # Animated bar while we wait for DeepSeek's first token. It edits the
-    # placeholder in-place, so the answer simply overwrites it — nothing to
-    # clean up and no extra message in the chat.
-    waiter = Waiter(placeholder,
-                    "Parsing files, DeepSeek is thinking"
-                    if file_ids else "DeepSeek is thinking")
+    # Determine initial waiter label — if queue, show "Analysing your request" as user requested
+    initial_label = "Parsing files, DeepSeek is thinking" if file_ids else "DeepSeek is thinking"
+    # If all slots busy, show queue message immediately (as per requirement: line-by-line queue)
+    if await POOL.would_wait():
+        queued = POOL.waiting_count + 1
+        initial_label = f"⏳ Analysing your request ...  (Queue: {queued} waiting, {POOL.size} slots busy)"
+    waiter = Waiter(placeholder, initial_label)
     await waiter.start()
+
+    # Background task to update waiter label with live queue position while we wait for a slot
+    async def _queue_updater():
+        while not waiter.stopped:
+            try:
+                if await POOL.would_wait():
+                    q = POOL.waiting_count
+                    # Show line-by-line queue position
+                    waiter.update_label(f"⏳ Analysing your request ...  (Queue position: {q+1} | {POOL.busy_count}/{POOL.size} busy)")
+                else:
+                    # slot freed -> show thinking
+                    waiter.update_label("Parsing files, DeepSeek is thinking" if file_ids else "DeepSeek is thinking")
+            except Exception:
+                pass
+            await asyncio.sleep(1.8)
+    queue_task = asyncio.create_task(_queue_updater())
 
     think_buf = ""
     answer_started = False
@@ -1686,20 +1894,34 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     full_answer = ""
     # Hold a DeepSeek key for the entire stream. N keys => N conversations can
     # run at the same time; everyone else queues here until one frees up.
+    # Queue display is line-by-line FIFO as requested.
     async with POOL.acquire(user_id, timeout=KEY_WAIT_TIMEOUT) as lease:
       if lease is None:
+        try:
+            queue_task.cancel()
+            try: await queue_task
+            except: pass
+        except: pass
         await waiter.stop()
         if POOL.size == 0:
-            oops = ("❌ <b>No DeepSeek key configured</b>\n\n"
-                    "<i>Ask the admin to add one from the admin panel.</i>")
+            oops = ("❌ <b>No DeepSeek key/account configured</b>\n\n"
+                    "<i>Admin panel → 🔑 DeepSeek Accounts → ➕ Add Email Account se ek account jodo.</i>")
         else:
-            oops = ("🕒 <b>All slots are busy</b>\n\n"
-                    f"This bot has <b>{POOL.size}</b> DeepSeek key(s), so "
+            oops = ("🕒 <b>All slots are busy — queue timed out</b>\n\n"
+                    f"This bot has <b>{POOL.size}</b> DeepSeek account(s), so "
                     f"<b>{POOL.size}</b> chat(s) can run at once.\n"
-                    "<i>Please send your message again in a moment.</i>")
+                    f"<i>({POOL.waiting_count} users still waiting) Please send your message again in a moment.</i>")
         await safe_edit(messages[-1], oops,
                         kb=response_footer_kb(has_text=False))
         return
+      # Got a slot — stop queue updater, keep waiter for thinking phase (it will be stopped on first token)
+      try:
+          queue_task.cancel()
+          try: await queue_task
+          except: pass
+      except: pass
+      # Ensure waiter shows thinking now that we have a slot
+      waiter.update_label("Parsing files, DeepSeek is thinking" if file_ids else "DeepSeek is thinking")
       try:
           got_any = False
           async for ev in stream_iter(lease.client):
@@ -1719,7 +1941,25 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
               if ev['type'] == 'msg_id':
                   s.parent_msg_id = ev['id']; continue
               if ev['type'] == 'error':
-                  await safe_edit(messages[-1], f"❌ {html.escape(ev['msg'])}",
+                  err_msg = ev['msg']
+                  # Try auto-refresh if it's an auth/token error and account has email
+                  is_auth_err = any(x in err_msg.lower() for x in ["401","403","unauthorized","token","expired","session","auth"])
+                  if is_auth_err and lease:
+                      try:
+                          # Attempt refresh via pool
+                          refreshed = await POOL.report_failure(lease.label, err_msg, notify_callback=lambda l,e,err: notify_owner(ctx.bot, f"⚠️ <b>Account error</b>\n<code>{html.escape(l)}</code> ({html.escape(e)})\n<i>{html.escape(err[:200])}</i>"))
+                          if refreshed:
+                              await safe_edit(messages[-1], f"🔄 <b>Token expired, auto-refreshed!</b>\n<i>Retrying your request...</i>",
+                                              kb=None)
+                              # Note: we don't auto-retry here to avoid loops, user can resend
+                          else:
+                              # Notify admin
+                              try:
+                                  await notify_owner(ctx.bot, f"⚠️ <b>DeepSeek account failed</b>\nLabel: <code>{html.escape(lease.label)}</code>\nError: <i>{html.escape(err_msg[:250])}</i>\n<i>Admin panel → Accounts → Refresh or check email/pass</i>")
+                              except: pass
+                      except Exception as ne:
+                          log.warning("report_failure error: %s", ne)
+                  await safe_edit(messages[-1], f"❌ {html.escape(err_msg)}",
                                   kb=response_footer_kb(has_text=False))
                   return
               if ev['type'] == 'think':
@@ -1820,16 +2060,58 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
 
       except Exception as e:
           log.exception("stream error")
+          # Check if it's auth-like and try refresh
+          try:
+              if lease and any(x in str(e).lower() for x in ["401","403","token","expired","auth"]):
+                  await POOL.report_failure(lease.label, str(e), notify_callback=lambda l,em,er: notify_owner(ctx.bot, f"⚠️ <b>Account exception</b>\n<code>{html.escape(l)}</code>\n<i>{html.escape(er[:200])}</i>"))
+                  try:
+                      await notify_owner(ctx.bot, f"⚠️ <b>Runtime error on account {html.escape(lease.label)}</b>\n<code>{html.escape(str(e)[:300])}</code>")
+                  except: pass
+          except: pass
           try:
               await safe_edit(messages[-1], f"❌ Error: {html.escape(str(e))}",
                                kb=response_footer_kb(has_text=False))
           except: pass
       finally:
           # guarantee the animator never outlives the request
+          try:
+              queue_task.cancel()
+              try: await queue_task
+              except: pass
+          except: pass
           await waiter.stop()
 
 
 # ---------- Post-init ----------
+async def health_check_loop(bot):
+    """Periodic health check for DeepSeek accounts — auto-refreshes expired tokens."""
+    # Wait a bit after boot
+    await asyncio.sleep(60)
+    while True:
+        try:
+            # Check every 6 hours
+            async def notify(lbl, email, err):
+                try:
+                    await bot.send_message(chat_id=OWNER_ID,
+                        text=f"⚠️ <b>Account auto-check failed</b>\n<code>{html.escape(lbl)}</code> ({html.escape(email)})\n<i>{html.escape(err[:250])}</i>\n\nAdmin panel → 🔑 DeepSeek Accounts → Refresh",
+                        parse_mode="HTML")
+                except Exception as ne:
+                    log.warning("health notify failed: %s", ne)
+            res = await POOL.health_check_all(notify_callback=notify)
+            if res["failed"] > 0 or res["refreshed"] > 0:
+                log.info("Health check: %s", res)
+                # Also send summary to owner if something happened
+                if res["refreshed"] > 0:
+                    try:
+                        await bot.send_message(chat_id=OWNER_ID,
+                            text=f"🔄 <b>Health check — {res['refreshed']} account(s) refreshed</b>\nHealthy: {res['healthy']}/{res['total']} · Failed: {res['failed']}",
+                            parse_mode="HTML", disable_notification=True)
+                    except: pass
+        except Exception as e:
+            log.warning("health_check_loop error: %s", e)
+        await asyncio.sleep(6 * 3600)  # 6 hours
+
+
 async def _post_init(app):
     log.info("post_init: connecting to MongoDB…")
     try:
@@ -1847,6 +2129,9 @@ async def _post_init(app):
 
         app.bot_data["wipe_task"] = asyncio.create_task(
             nightly_wipe_loop(app.bot, OWNER_ID))
+        app.bot_data["health_task"] = asyncio.create_task(
+            health_check_loop(app.bot))
+        log.info("Health check loop started (6h interval)")
 
         await app.bot.set_my_commands([
             BotCommand("start", "Open the menu"),
@@ -1862,7 +2147,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v6"
+        version = "v7-email-accounts"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:
@@ -1872,12 +2157,12 @@ async def _post_init(app):
         if seen != version:
             await app.bot.send_message(
                 chat_id=OWNER_ID,
-                text="🚀 <b>Bot v6 is live — multi-user</b>\n\n"
+                text="🚀 <b>Bot v7 is live — email accounts & queue</b>\n\n"
                      "👥 Users, approvals, blocking, broadcast\n"
-                     "🔑 DeepSeek key pool — each key = one more "
-                     "simultaneous user\n"
-                     "🗄 MongoDB storage · chats auto-delete nightly\n\n"
-                     "/admin for the control panel.",
+                     "🔑 DeepSeek accounts via email/pass — auto-refresh!\n"
+                     "⏳ Queue: 1 account=1 user, others wait line-by-line<br> FIFO<br>\n"
+                     "🗄 MongoDB · auto health check every 6h\n\n"
+                     "/admin → 🔑 DeepSeek Accounts for management.",
                 parse_mode="HTML",
             )
             try:
@@ -2036,7 +2321,7 @@ async def _run_with_health():
         log.info("Bot + health running…")
         await stopping.wait()
     finally:
-        for key in ("wipe_task", "lock_task"):
+        for key in ("wipe_task", "health_task", "lock_task"):
             t = app.bot_data.get(key)
             if t:
                 t.cancel()

@@ -25,11 +25,16 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 log = logging.getLogger("db")
 
-MONGO_URL = os.getenv(
-    "MONGO_URL",
-    "mongodb+srv://user:pass@cluster.mongodb.net/?appName=Cluster0",
-)
+MONGO_URL = os.getenv("MONGO_URL", "")
 DB_NAME = os.getenv("MONGO_DB", "deepseek_bot")
+
+if not MONGO_URL:
+    raise SystemExit(
+        "❌ Missing MONGO_URL.\n"
+        "Set it to your MongoDB connection string, e.g.\n"
+        "  MONGO_URL=mongodb+srv://user:pass@cluster.mongodb.net/?appName=Cluster0\n"
+        "Never hardcode credentials in source code."
+    )
 
 # How long a chat turn survives. The nightly job also clears everything, this
 # is the belt-and-braces safety net in case the bot is down at midnight.

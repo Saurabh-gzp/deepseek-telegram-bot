@@ -125,6 +125,9 @@ class UserState:
     msg_count: int = 0
     total_chars_in: int = 0
     total_chars_out: int = 0
+    # Telegram message id of the user's last normal prompt (memory-only).
+    # Editing that message re-runs it — app-style "edit message → regen".
+    last_prompt_msg_id: Optional[int] = None
 
 # Write-through cache: uid -> UserState mirrored in MongoDB.
 STATE: Dict[int, UserState] = {}
@@ -288,7 +291,7 @@ def _parse_email_account_input(text: str):
 
 
 # ---------- UI ----------
-def status_text(s: UserState) -> str:
+def status_text(s: UserState, uid: int = 0) -> str:
     p = get_persona(s.persona)
     think = "ON" if s.thinking else "OFF"
     search = "ON" if (s.search and not s.attached_files) else "OFF"
@@ -300,6 +303,15 @@ def status_text(s: UserState) -> str:
         f"🔊 Voice: <b>{'ON' if s.voice_reply else 'OFF'}</b> ({'♀' if s.tts_female else '♂'})  |  🔗 URL fetch: <b>{'ON' if s.auto_urls else 'OFF'}</b>",
         f"🆔 Session: <code>{sess}</code>",
     ]
+    # Pool account this user is pinned to (app-like account indicator)
+    if uid:
+        try:
+            idx = POOL.label_index(POOL.current_label(uid))
+            if idx:
+                lines.append(f"👤 Account: <b>#{idx}</b> · pool "
+                             f"{POOL.free_count}/{POOL.size} free")
+        except Exception:
+            pass
     if s.attached_files:
         names = ", ".join(f[1] for f in s.attached_files)
         lines.append(f"📎 Attached: <b>{html.escape(names)}</b>")
@@ -325,7 +337,8 @@ def main_menu_kb(s: UserState, uid: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🎭 Persona: {get_persona(s.persona)['name']}",
                               callback_data="personas:0")],
         [InlineKeyboardButton("🆕 New Chat", callback_data="cmd:new"),
-         InlineKeyboardButton("📁 My Chats", callback_data="chats:0"),
+         InlineKeyboardButton("🔄 Account", callback_data="acct:switch")],
+        [InlineKeyboardButton("📁 My Chats", callback_data="chats:0"),
          InlineKeyboardButton("📤 Export", callback_data="cmd:export")],
         [InlineKeyboardButton("📊 Stats", callback_data="cmd:stats"),
          InlineKeyboardButton("🗑 Delete", callback_data="cmd:delete_ask"),
@@ -443,6 +456,12 @@ HELP_TEXT = (
 "🔁 <b>Regen</b> — retry menu: fresh answer / ✂️ more concise / 📖 more details\n"
 "⚡ <b>Quick actions</b> — Translate/Summarize/Rephrase/Explain/Continue\n"
 "⏹ <b>Stop</b> — appears while generating (also /cancel)\n\n"
+"<b>App-parity features:</b>\n"
+"✏️ <b>Edit → Regen</b> — apna LAST message edit karo, jawab naye text "
+"se dobara banega (app jaisa)\n"
+"🔄 <b>Account</b> — Menu button se doosre pool account pe switch karo "
+"(naya chat usi account pe banega)\n"
+"🧠 <b>Thinking</b> — jawab ke upar collapsed block, tap karke expand\n\n"
 "<b>Toggles:</b>\n"
 "🧠 Think — reasoning chain\n"
 "🌐 Search — real-time web\n"
@@ -467,7 +486,7 @@ HELP_TEXT = (
 
 # ---------- Utility ----------
 async def send_menu(target, s: UserState, edit: bool = False, uid: int = 0):
-    text = status_text(s)
+    text = status_text(s, uid)
     kb = main_menu_kb(s, uid)
     try:
         if edit:
@@ -485,6 +504,21 @@ def _ticker_view(think_buf: str) -> str:
     tail = " ".join(words[-THINK_TICKER_WORDS:]).replace("\n", " ")
     if len(tail) > 240: tail = "…" + tail[-240:]
     return f"🤔 <i>{html.escape(tail) if tail else '…'}</i> ▍"
+
+
+def _think_block_html(think_buf: str, room: int) -> str:
+    """
+    Collapsible 🧠 reasoning block — Telegram's expandable blockquote, so the
+    final answer carries the model's thinking the same way the official app
+    does (collapsed by default, tap to expand). Returns "" when it can't fit.
+    """
+    t = (think_buf or "").strip()
+    if room < 160 or not t:
+        return ""
+    if len(t) > room:
+        t = t[:room].rstrip() + " …"
+    return ("<blockquote expandable>🧠 <b>Thinking</b>\n"
+            + html.escape(t) + "</blockquote>\n\n")
 
 
 async def record_history(uid: int, role: str, text: str):
@@ -767,6 +801,28 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # via a random pool key caused cross-account "invalid chat session id".
         s.session_id = None; s.session_key = None; s.parent_msg_id = None; s.attached_files = []
         await save_session(q.from_user.id); await q.answer("New chat started")
+        try: await send_menu(q, s, edit=True, uid=q.from_user.id)
+        except: await q.message.reply_html(status_text(s), reply_markup=main_menu_kb(s, q.from_user.id))
+        return
+
+    if data == "acct:switch":
+        # App-parity: user switches to another pool account (like switching
+        # profiles in the app). DeepSeek sessions are account-scoped, so the
+        # cached session is dropped — the next message opens a fresh chat on
+        # the new account (stream_iter creates it on the leased client).
+        new = await POOL.switch_for(q.from_user.id)
+        if not new:
+            if POOL.size <= 1:
+                await q.answer("Pool me sirf ek account hai — switch ke liye "
+                               "Admin panel se ek aur add karo.", show_alert=True)
+            else:
+                await q.answer("Doosre accounts abhi busy hain — thodi der "
+                               "baad try karo.", show_alert=True)
+            return
+        s.session_id = None; s.session_key = new; s.parent_msg_id = None
+        await save_session(q.from_user.id)
+        idx = POOL.label_index(new) or "?"
+        await q.answer(f"✅ Account #{idx} pe switch ho gaya")
         try: await send_menu(q, s, edit=True, uid=q.from_user.id)
         except: await q.message.reply_html(status_text(s), reply_markup=main_menu_kb(s, q.from_user.id))
         return
@@ -1741,6 +1797,28 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def on_edited(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    App-parity: editing your LAST message re-runs it — DeepSeek generates a
+    fresh answer for the edited text (app: edit message → new response).
+    Only the most recent prompt is re-runnable, like the official app.
+    """
+    msg = update.edited_message
+    if not msg or not msg.text:
+        return
+    if not await gate(update):
+        return
+    uid = update.effective_user.id
+    s = get_state(uid)
+    if not s.last_prompt_msg_id or msg.message_id != s.last_prompt_msg_id:
+        return  # not the last prompt — silently ignore (no spam)
+    log.info("Edit→regen: user %s edited prompt %s", uid, msg.message_id)
+    await _process_prompt_chat(
+        ctx=ctx, chat_id=update.effective_chat.id, user_id=uid,
+        prompt=msg.text, reply_to_msg_id=msg.message_id,
+        is_regen=True)
+
+
 async def _try_url_summarize(ctx, update, url: str, original_text: str) -> bool:
     """Fetch URL/YT, then feed content to DeepSeek. Returns True if handled."""
     msg = update.message
@@ -1897,6 +1975,11 @@ async def _process_prompt_chat(*, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
             text="⏳ <i>Your previous request is still running — this one is "
                  "queued and will start right after.</i>", parse_mode="HTML")
     CANCELLED.discard(user_id)
+    # remember this message id so an EDIT of it re-runs the prompt
+    # (app-style edit-message → regen). Done here — the accepted entry
+    # point — so retries/quick actions never hijack it.
+    if not is_regen and not is_quick_action and reply_to_msg_id:
+        get_state(user_id).last_prompt_msg_id = reply_to_msg_id
     async with lock:
         await _process_prompt_chat_inner(
             ctx=ctx, chat_id=chat_id, user_id=user_id, prompt=prompt,
@@ -1971,6 +2054,40 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     current_text = ""
     last_edit = 0.0
     edit_interval = 1.1  # base throttle; long answers stretch (see below)
+
+    # --- native draft streaming (Bot API sendMessageDraft, PTB 22.8+) ---
+    # Telegram clients render a live "draft" bubble natively; we mirror the
+    # stream into it and keep the anchor bubble quiet. Any failure (old
+    # client, flood, unsupported method) silently falls back to the classic
+    # placeholder-edit streaming.
+    native_enabled = os.getenv("NATIVE_STREAM", "1") == "1"
+    nat = {"tried": False, "on": False, "id": 0}
+    quiet = [False]
+
+    async def native_draft(html_text: str):
+        if not native_enabled:
+            return
+        if not nat["tried"]:
+            nat["tried"] = True
+            nat["id"] = secrets.randbits(24)
+        try:
+            await ctx.bot.send_message_draft(chat_id=chat_id,
+                                             draft_id=nat["id"],
+                                             text=html_text, parse_mode="HTML")
+            nat["on"] = True
+        except Exception:
+            nat["on"] = False   # unsupported here → classic edit streaming
+
+    async def native_draft_clear():
+        on = nat["on"]
+        nat["on"] = False
+        if not on:
+            return
+        try:
+            await ctx.bot.send_message_draft(chat_id=chat_id,
+                                             draft_id=nat["id"], text=None)
+        except Exception:
+            pass
 
     def stream_iter(lease):
         """Bridge the blocking generator onto the event loop.
@@ -2244,7 +2361,17 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                       else:
                           txt = "⏳ <i>thinking…</i>"
                   txt = safe_for_telegram(txt, MAX_TG_MSG)
-                  if not await safe_edit(messages[-1], txt, kb=stop_kb()):
+                  if nat["on"] or not nat["tried"]:
+                      await native_draft(txt)
+                  if nat["on"]:
+                      # Native draft carries the live text — keep the anchor
+                      # bubble quiet so users don't read the same thing twice.
+                      if not quiet[0]:
+                          quiet[0] = True
+                          await safe_edit(messages[-1],
+                                          "⏳ <i>Live stream chal raha hai…</i>",
+                                          kb=stop_kb())
+                  elif not await safe_edit(messages[-1], txt, kb=stop_kb()):
                       # flood-limited even after the in-edit retry → pause
                       last_edit = now + 3.0
 
@@ -2275,6 +2402,7 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
           total_len = len(full_answer)
 
           if total_len > FILE_THRESHOLD:
+              await native_draft_clear()
               preview_html = md_to_tg_html(full_answer[:2500]) + "\n\n<i>… (see file below)</i>"
               preview_html = safe_for_telegram(preview_html, MAX_TG_MSG)
               await safe_edit(messages[0], preview_html, kb=None)
@@ -2293,7 +2421,16 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                   final = "⚠️ Model didn't produce an answer."
               else:
                   final = md_to_tg_html(current_text) if current_text else "(empty)"
+                  # App-parity: collapsed 🧠 reasoning block above the answer
+                  # (Telegram expandable blockquote — tap to expand).
+                  if thinking_on and think_buf.strip():
+                      room = MAX_TG_MSG - len(final) - 60
+                      think_html = _think_block_html(think_buf, room)
+                      if think_html:
+                          final = think_html + final
               final = safe_for_telegram(final, MAX_TG_MSG)
+              # clear the native draft first so the final message replaces it
+              await native_draft_clear()
               # The final bubble MUST land — retry harder than a streaming edit.
               for _ in range(3):
                   if await safe_edit(messages[-1], final,
@@ -2330,6 +2467,11 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
               except: pass
           except: pass
           await waiter.stop()
+          # stop/cancel/error paths: make sure no native draft lingers
+          try:
+              await native_draft_clear()
+          except Exception:
+              pass
 
 
 # ---------- Post-init ----------
@@ -2397,7 +2539,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.6-stream-hardening"
+        version = "v7.7-app-parity"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:
@@ -2479,6 +2621,8 @@ def build_app():
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE
+                                   & filters.ChatType.PRIVATE, on_edited))
     app.add_error_handler(on_error)
     return app
 

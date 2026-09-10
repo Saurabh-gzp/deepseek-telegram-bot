@@ -464,6 +464,79 @@ async def run():
        "System instruction" in wrapped and "hello" in wrapped)
     ok("default persona → no wrap", wrap_prompt("x", "default") == "x")
 
+    print("\n===== 18. App-parity: account switch, edit→regen, think block =====")
+    from bot import _think_block_html
+
+    # --- 🧠 collapsible thinking block ---
+    blk = _think_block_html("step 1: soch raha hoon\nstep 2: answer", 1200)
+    ok("think block expandable",
+       blk.startswith("<blockquote expandable>") and "Thinking" in blk)
+    esc = _think_block_html("a<b>&c", 500)
+    ok("think block escapes html", "&lt;b&gt;" in esc and "a<b>" not in esc)
+    ok("think block skips when no room", _think_block_html("abc", 100) == "")
+    ok("think block skips when empty", _think_block_html("   ", 500) == "")
+
+    # --- 🔄 account switch ---
+    STATE.clear(); s = get_state(OWNER_ID)
+    s.session_id = "sess123"; s.session_key = "key1"
+    async def fake_switch(uid):
+        return "key2"
+    _bot.POOL.switch_for = fake_switch
+    _bot.POOL.label_index = lambda l: 2
+    _bot.POOL.current_label = lambda uid: "key2"
+    u, q = mk_query("acct:switch"); await on_button(u, mk_ctx())
+    ok("switch drops session + repins key",
+       s.session_id is None and s.session_key == "key2" and s.parent_msg_id is None)
+    ok("switch confirms", q.answer.called and "#2" in str(q.answer.call_args))
+    ok("switch re-renders menu", q.edit_message_text.called)
+    # nothing to switch to → graceful refusal
+    async def fake_switch_none(uid):
+        return None
+    _bot.POOL.switch_for = fake_switch_none
+    u, q = mk_query("acct:switch"); await on_button(u, mk_ctx())
+    ok("switch refused gracefully",
+       q.answer.called and not q.edit_message_text.called)
+    for attr in ("switch_for", "label_index", "current_label"):
+        try: delattr(_bot.POOL, attr)
+        except AttributeError: pass
+
+    # --- ✏️ edit message → regen ---
+    STATE.clear(); s = get_state(OWNER_ID)
+    s.last_prompt_msg_id = 555
+    called = {}
+    async def fake_proc(**kw):
+        called.update(kw)
+    with patch.object(_bot, "_process_prompt_chat", side_effect=fake_proc):
+        u = mk_update(text="edited prompt text")
+        u.edited_message = u.message
+        u.edited_message.message_id = 555
+        await _bot.on_edited(u, mk_ctx())
+    ok("edited last prompt → regen with new text",
+       called.get('prompt') == "edited prompt text"
+       and called.get('is_regen') is True
+       and called.get('reply_to_msg_id') == 555)
+    called.clear()
+    u = mk_update(text="edit of an older message")
+    u.edited_message = u.message
+    u.edited_message.message_id = 42
+    await _bot.on_edited(u, mk_ctx())
+    ok("edit of older message ignored", not called)
+    called.clear()
+    u = mk_update(text="no prompt sent yet")
+    u.edited_message = u.message
+    u.edited_message.message_id = 777
+    await _bot.on_edited(u, mk_ctx())
+    ok("edit without known last prompt ignored", not called)
+
+    # normal prompts record their message id for future edits
+    STATE.clear()
+    with patch.object(_bot, "_process_prompt_chat_inner", side_effect=fake_proc):
+        u = mk_update(text="normal prompt")
+        u.message.message_id = 901
+        await on_text(u, mk_ctx())
+    ok("last prompt msg id tracked",
+       get_state(OWNER_ID).last_prompt_msg_id == 901)
+
     print(f"\n{'='*50}\nRESULTS: {PASS} passed, {FAIL} failed\n{'='*50}")
     sys.exit(0 if FAIL == 0 else 1)
 

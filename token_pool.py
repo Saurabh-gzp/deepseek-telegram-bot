@@ -304,6 +304,47 @@ class TokenPool:
             if label in self._tokens and self._free is not None:
                 self._free.put_nowait(label)
 
+    # ---------- user-initiated account switch ----------
+
+    def current_label(self, uid: int) -> Optional[str]:
+        """The pool label this user is pinned to (affinity), if any."""
+        return self._pref.get(uid)
+
+    def label_index(self, label: Optional[str]) -> Optional[int]:
+        """1-based position of a label in the pool (for masked display)."""
+        if not label:
+            return None
+        labels = list(self._tokens.keys())
+        try:
+            return labels.index(label) + 1
+        except ValueError:
+            return None
+
+    async def switch_for(self, uid: int) -> Optional[str]:
+        """
+        App-style "switch account": pin this user's affinity to a DIFFERENT
+        free account. Returns the new label, or None when there is nothing
+        to switch to (single account, or every other key is busy — switching
+        to a busy key would not stick, since sticky affinity never preempts).
+
+        The caller MUST drop the user's session afterwards: DeepSeek sessions
+        are account-scoped, so the next message opens a fresh chat on the
+        new account.
+        """
+        if self._free is None:
+            await self.reload()
+        cur = self._pref.get(uid)
+        free_labels = [l for l in list(getattr(self._free, "_queue", []))
+                       if l != cur]
+        if not free_labels:
+            return None
+        new = free_labels[0]
+        self._pref[uid] = new
+        if len(self._pref) > 1000:  # bounded memory, same as acquire()
+            self._pref.pop(next(iter(self._pref)), None)
+        log.info("User %s switched account: %s -> %s", uid, cur or "-", new)
+        return new
+
     async def wipe_all_accounts(self) -> Dict[str, Any]:
         """
         App equivalent of Settings → Data controls → Delete all chats — but

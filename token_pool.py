@@ -19,7 +19,8 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Tuple
 
 import db
-from deepseek_client import DeepSeekClient, login_with_credentials, validate_token
+from deepseek_client import (DeepSeekClient, login_with_credentials,
+                             login_with_credentials_ex, validate_token)
 
 log = logging.getLogger("pool")
 
@@ -128,12 +129,17 @@ class TokenPool:
             return False, "No email/password stored — add email/pass to enable auto-refresh"
         # Try login
         try:
-            new_token = await asyncio.to_thread(login_with_credentials, email, password)
+            new_token, reason = await asyncio.to_thread(
+                login_with_credentials_ex, email, password)
         except Exception as e:
             return False, f"Login exception: {e}"
         if not new_token:
-            await db.mark_token(label, healthy=False, error="Login failed — check email/password")
-            return False, "Login failed — wrong email/password or DeepSeek blocked"
+            await db.mark_token(label, healthy=False,
+                                error=f"Login failed ({reason})")
+            if reason == "bot_blocked":
+                return False, ("DeepSeek anti-bot ne server ka login block kiya "
+                               "(cloud IP). Manual token add karo ya DS_PROXY set karo.")
+            return False, f"Login failed — {reason}"
         ok = await db.update_account_token(label, new_token)
         if ok:
             # update in-memory

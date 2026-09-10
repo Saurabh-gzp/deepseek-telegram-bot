@@ -13,35 +13,79 @@ from typing import Optional, Iterator, List, Tuple, Dict, Any
 import requests
 
 
-def login_with_credentials(email: str, password: str) -> Optional[str]:
+def _ds_proxies() -> Optional[dict]:
+    """Explicit proxy for DeepSeek login traffic (DS_PROXY wins over env)."""
+    p = (os.getenv("DS_PROXY") or os.getenv("HTTPS_PROXY")
+         or os.getenv("https_proxy") or os.getenv("HTTP_PROXY")
+         or os.getenv("http_proxy") or "").strip()
+    return {"http": p, "https": p} if p else None
+
+
+def login_with_credentials_ex(email: str, password: str) -> Tuple[Optional[str], str]:
     """
-    Login to DeepSeek with email/password, return session token or None.
-    Uses Android API endpoint as in v5.2 terminal client.
+    Login to DeepSeek with email/password.
+    Returns (token, reason): token is None on failure and `reason` explains why:
+      'ok'          — success
+      'bot_blocked' — DeepSeek's anti-bot challenge hit this server's IP
+                      (cloud/datacenter IPs get challenged; needs a proxy)
+      'api_changed' — DeepSeek changed the login contract
+      'rate_limited'— too many login attempts
+      anything else — upstream message (e.g. wrong password) or error tag
+
+    Uses the web client contract (os='web' + web headers). The old
+    Android-API trick (os='Android') is dead — DeepSeek now returns
+    HTTP 422 {"detail":[{"loc":"body.os"}]} for it.
     """
     url = "https://chat.deepseek.com/api/v0/users/login"
-    login_headers = {
+    web_headers = {
+        'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.9',
         'Content-Type': 'application/json',
-        'User-Agent': 'DeepSeek/2.0.2 (Android; API)',
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/124.0 Safari/537.36'),
         'Origin': 'https://chat.deepseek.com',
-        'Referer': 'https://chat.deepseek.com/'
+        'Referer': 'https://chat.deepseek.com/sign_in',
+        'x-app-version': '20241129.1',
+        'x-client-locale': 'en_US',
+        'x-client-platform': 'web',
+        'x-client-version': '1.0.0-always',
     }
-    data = {
+    payload = {
         'email': email,
         'password': password,
         'device_id': str(uuid.uuid4()),
-        'os': 'Android'
+        'os': 'web',
     }
+    proxies = _ds_proxies()
     try:
-        resp = requests.post(url, headers=login_headers, json=data, timeout=20)
+        resp = requests.post(url, headers=web_headers, json=payload,
+                             timeout=20, proxies=proxies)
         if resp.status_code == 200:
             result = resp.json()
             if result.get('code') == 0 and 'data' in result:
-                token = result['data'].get('biz_data', {}).get('user', {}).get('token')
+                token = (result.get('data', {}).get('biz_data', {})
+                         .get('user', {}).get('token'))
                 if token:
-                    return token
-        return None
-    except Exception:
-        return None
+                    return token, 'ok'
+                return None, 'token_missing'
+            return None, (result.get('msg') or 'DeepSeek rejected the login')
+        body_head = (resp.text or '')[:200].lower()
+        if resp.status_code == 202 or not body_head or '<html' in body_head:
+            return None, 'bot_blocked'
+        if resp.status_code == 422:
+            return None, 'api_changed'
+        if resp.status_code == 429:
+            return None, 'rate_limited'
+        return None, f'HTTP {resp.status_code}'
+    except Exception as e:
+        return None, f'network: {type(e).__name__}'
+
+
+def login_with_credentials(email: str, password: str) -> Optional[str]:
+    """Backward-compatible wrapper. Returns token or None (use _ex for reason)."""
+    token, _ = login_with_credentials_ex(email, password)
+    return token
 
 
 def validate_token(token: str, workdir: str = ".") -> bool:

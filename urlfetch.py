@@ -75,6 +75,19 @@ class YouTubeFetchError(RuntimeError):
     """All transcript sources failed — message contains the reason + fix."""
 
 
+def youtube_enabled() -> bool:
+    """
+    True when YouTube fetching has a realistic chance of working.
+    Cloud hosts (Render etc.) get blocked by YouTube, so without a proxy
+    or cookies the feature just produces failures — callers should skip
+    the YouTube path (and not show error messages) when this is False.
+    Set YT_FORCE=1 to force-enable anyway.
+    """
+    if os.getenv("YT_FORCE") == "1":
+        return True
+    return bool(_yt_proxy() or _yt_cookiefile())
+
+
 # --------------------------------------------------------------------------
 # URL helpers (unchanged API)
 # --------------------------------------------------------------------------

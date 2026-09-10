@@ -42,11 +42,12 @@ from telegram.ext import (
     ContextTypes, filters,
 )
 
-from deepseek_client import DeepSeekClient, RULES, login_with_credentials
+from deepseek_client import DeepSeekClient, RULES, login_with_credentials, login_with_credentials_ex
 from md2tg import md_to_tg_html, strip_incomplete_markers, safe_for_telegram
 from personas import PERSONAS, get_persona, wrap_prompt
 from progress import Progress, Waiter
-from urlfetch import extract_urls, is_youtube, fetch_url_text, fetch_youtube_transcript
+from urlfetch import (extract_urls, is_youtube, fetch_url_text,
+                      fetch_youtube_transcript, youtube_enabled)
 
 import admin as adm
 import db
@@ -403,6 +404,9 @@ def chats_kb(chats: list, page: int = 0, per_page: int = 8) -> InlineKeyboardMar
     return InlineKeyboardMarkup(rows)
 
 
+_YT_HELP_LINE = ("▶️ YouTube link — summary from transcript\n\n" if youtube_enabled() else
+                 "▶️ YouTube link — ❌ host pe YT_PROXY chahiye (YouTube cloud IPs block karta hai)\n\n")
+
 HELP_TEXT = (
 "<b>🤖 DeepSeek Bot — Complete Guide</b>\n\n"
 "<b>Input types (all supported):</b>\n"
@@ -411,7 +415,7 @@ HELP_TEXT = (
 "🖼 Photo — OCR text extraction\n"
 "📎 Document — upload + question caption\n"
 "🔗 URL — auto fetch and summarize\n"
-"▶️ YouTube link — summary from transcript\n\n"
++ _YT_HELP_LINE +
 "<b>Modes:</b>\n"
 "🚀 Instant — fast, supports search+files\n"
 "💎 Expert — deep reasoning\n"
@@ -1324,20 +1328,43 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
             return True
         await update.message.reply_html(f"⏳ <b>Logging in {email}...</b>\n<i>DeepSeek se token fetch kar raha hu, thoda wait...</i>")
         try:
-            token = await asyncio.to_thread(login_with_credentials, email, password)
+            token, reason = await asyncio.to_thread(login_with_credentials_ex, email, password)
         except Exception as e:
             await update.message.reply_html(f"❌ Login exception: <code>{html.escape(str(e)[:200])}</code>")
             return True
         if not token:
-            await update.message.reply_html(
-                f"❌ <b>Login failed for {html.escape(email)}</b>\n"
-                "Check email/password. DeepSeek ne reject kiya.\n"
-                "<i>Tip: DeepSeek web pe manually login karke dekho ki credentials sahi hain.</i>"
-            )
+            if reason == "bot_blocked":
+                await update.message.reply_html(
+                    f"🛡 <b>DeepSeek ne server ka login request block kiya</b>\n"
+                    f"Email: <code>{html.escape(email)}</code>\n\n"
+                    "DeepSeek ka anti-bot cloud-server IPs (Render etc.) pe challenge "
+                    "deta hai — ye credentials ka problem <b>nahi</b> hai.\n\n"
+                    "<b>✅ Pakka fix — Add Token (manual):</b>\n"
+                    "1. Apne phone/PC browser me <code>chat.deepseek.com</code> pe login karo\n"
+                    "2. Browser me DevTools/Console kholo aur type karo:\n"
+                    "<code>localStorage.getItem(\"userToken\")</code>\n"
+                    "3. Jo lambi string aaye usko copy karo\n"
+                    "4. Admin panel → ➕ <b>Add Token (manual)</b> → paste karo\n\n"
+                    "<i>Ya Render pe <b>DS_PROXY</b> env var me residential proxy "
+                    "daalo, phir email login bhi chalega.</i>")
+            elif reason == "api_changed":
+                await update.message.reply_html(
+                    f"❌ <b>Login failed for {html.escape(email)}</b>\n"
+                    "DeepSeek ne login API change kar di hai — bot update chahiye. "
+                    "Filhal ➕ <b>Add Token (manual)</b> use karo.")
+            else:
+                await update.message.reply_html(
+                    f"❌ <b>Login failed for {html.escape(email)}</b>\n"
+                    f"Reason: <code>{html.escape(str(reason)[:200])}</code>\n"
+                    "<i>Wrong email/password ho sakta hai, ya ➕ Add Token (manual) use karo.</i>")
             # Notify owner about failure
             try:
-                await ctx.bot.send_message(chat_id=OWNER_ID, text=f"⚠️ <b>Account add failed</b>\nEmail: <code>{html.escape(email)}</code>\nError: Login failed", parse_mode="HTML")
-            except: pass
+                await ctx.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=(f"⚠️ <b>Account add failed</b>\nEmail: <code>{html.escape(email)}</code>\n"
+                          f"Reason: <code>{html.escape(str(reason)[:150])}</code>"),
+                    parse_mode="HTML")
+            except Exception: pass
             return True
         ok = await db.add_email_account(label, email, password, token)
         if not ok:
@@ -1642,6 +1669,11 @@ async def _try_url_summarize(ctx, update, url: str, original_text: str) -> bool:
     """Fetch URL/YT, then feed content to DeepSeek. Returns True if handled."""
     msg = update.message
     yt_id = is_youtube(url)
+    if yt_id and not youtube_enabled():
+        # YouTube blocks cloud IPs and no YT_PROXY/YT_COOKIES is configured —
+        # silently treat the link as normal text instead of failing loudly.
+        log.info("YouTube fetch disabled (no YT_PROXY/YT_COOKIES) — %s treated as text", url[:60])
+        return False
     kind = "YouTube" if yt_id else "Web page"
     prompt = None
 
@@ -2154,7 +2186,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7-email-accounts"
+        version = "v7.1-fixes"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:
@@ -2167,7 +2199,7 @@ async def _post_init(app):
                 text="🚀 <b>Bot v7 is live — email accounts & queue</b>\n\n"
                      "👥 Users, approvals, blocking, broadcast\n"
                      "🔑 DeepSeek accounts via email/pass — auto-refresh!\n"
-                     "⏳ Queue: 1 account=1 user, others wait line-by-line<br> FIFO<br>\n"
+                     "⏳ Queue: 1 account=1 user, others wait line-by-line (FIFO)\n"
                      "🗄 MongoDB · auto health check every 6h\n\n"
                      "/admin → 🔑 DeepSeek Accounts for management.",
                 parse_mode="HTML",

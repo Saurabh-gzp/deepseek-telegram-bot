@@ -238,15 +238,22 @@ class DeepSeekClient:
     def list_chats(self) -> List[Dict[str, Any]]:
         r = requests.get(f"{self.BASE}/chat_session/fetch_page", headers=self.headers, timeout=30)
         if r.status_code == 200:
-            return r.json().get('data', {}).get('biz_data', {}).get('chat_sessions', [])
+            try:
+                d = r.json().get('data') or {}
+                return (d.get('biz_data') or {}).get('chat_sessions') or []
+            except Exception:
+                return []
         return []
 
     def get_history(self, sess_id: str) -> Tuple[List[dict], Optional[str]]:
         r = requests.get(f"{self.BASE}/chat/history_messages",
                          headers=self.headers, params={'chat_session_id': sess_id}, timeout=30)
         if r.status_code == 200:
-            d = r.json().get('data', {}).get('biz_data', {})
-            return d.get('chat_messages', []), d.get('chat_session', {}).get('current_message_id')
+            try:
+                d = (r.json().get('data') or {}).get('biz_data') or {}
+                return d.get('chat_messages') or [], d.get('chat_session', {}).get('current_message_id')
+            except Exception:
+                return [], None
         return [], None
 
     def create_chat(self) -> Optional[str]:
@@ -259,12 +266,40 @@ class DeepSeekClient:
     def delete_chat(self, sess_id: str) -> bool:
         r = requests.post(f"{self.BASE}/chat_session/delete",
                           headers=self.headers, json={'chat_session_id': sess_id}, timeout=30)
-        return r.status_code == 200
+        if r.status_code != 200:
+            return False
+        # Business errors ride on HTTP 200 (code/biz_code != 0) — same trap as
+        # the old "invalid chat session id". Check them, don't trust the status.
+        try:
+            j = r.json()
+        except Exception:
+            return False
+        biz = (j.get('data') or {}).get('biz_code', 0)
+        return j.get('code', 1) == 0 and biz == 0
 
-    def delete_all_chats(self) -> bool:
-        r = requests.post(f"{self.BASE}/chat_session/delete_all",
-                          headers=self.headers, json={}, timeout=30)
-        return r.status_code == 200
+    def delete_all_chats(self) -> Tuple[bool, str]:
+        """App equivalent: Settings → Data controls → Delete all chats.
+
+        The app sends a plain POST with no JSON body; an empty JSON body also
+        works. Returns (ok, detail) — detail explains any business error so
+        the pool-wide wipe can report exactly which account failed and why.
+        """
+        try:
+            r = requests.post(f"{self.BASE}/chat_session/delete_all",
+                              headers=self.headers, json={}, timeout=30)
+        except Exception as e:
+            return False, f"network: {e}"
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}"
+        try:
+            j = r.json()
+        except Exception:
+            return False, "non-JSON response"
+        biz = (j.get('data') or {}).get('biz_code', 0)
+        if j.get('code', 1) == 0 and biz == 0:
+            return True, "ok"
+        msg = (j.get('msg') or (j.get('data') or {}).get('biz_msg') or 'unknown error')
+        return False, f"code={j.get('code')} biz={biz}: {msg}"[:200]
 
     # ---------- File upload ----------
     # Terminal statuses returned by /file/fetch_files. Anything not in this set

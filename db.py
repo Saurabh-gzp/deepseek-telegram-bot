@@ -486,7 +486,21 @@ async def clear_history(uid: int) -> int:
 async def wipe_all_history() -> int:
     """Nightly reset: drop every stored turn and detach every DeepSeek session."""
     r = await _db.history.delete_many({})
-    await _db.users.update_many(
-        {}, {"$set": {"session_id": None, "parent_msg_id": None,
-                      "attached_files": []}})
+    await clear_all_sessions()
     return r.deleted_count
+
+
+async def clear_all_sessions() -> int:
+    """
+    Detach EVERY user's cached DeepSeek session pointer.
+
+    Needed after a pool-wide chat wipe: delete_all on all accounts kills every
+    cloud session at once, so all cached session_id/parent_msg_id pairs become
+    stale. Resetting them up-front means users get a clean session on their
+    next message instead of relying on stale-session auto-recovery.
+    """
+    r = await _db.users.update_many(
+        {},
+        {"$set": {"session_id": None, "session_key": None,
+                  "parent_msg_id": None, "attached_files": []}})
+    return r.modified_count

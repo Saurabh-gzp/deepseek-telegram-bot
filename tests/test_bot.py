@@ -43,6 +43,14 @@ async def _noop(*a, **k):
     return None
 
 
+async def _async_ret(v):
+    return v
+
+
+async def _fake_list_tokens(*a, **k):
+    return []
+
+
 async def _fake_turn(uid, role, text):
     _FAKE_TURNS.append((uid, role, text))
 
@@ -71,8 +79,9 @@ def _install_stubs():
     _bot.db.get_history = _fake_hist
     for name in ("set_user_field", "bump_usage", "upsert_user",
                  "clear_history", "mark_token", "set_user_status",
-                 "bump_token_use"):
+                 "bump_token_use", "clear_all_sessions"):
         setattr(_bot.db, name, _noop)
+    _bot.db.list_tokens = _fake_list_tokens
     _bot.save_settings = _noop
     _bot.save_session = _noop
 
@@ -208,8 +217,31 @@ async def run():
         ok("switch works", get_state(OWNER_ID).session_id == "s1")
         u, q = mk_query("cmd:delete_yes"); await on_button(u, mk_ctx())
         ok("delete", get_state(OWNER_ID).session_id is None)
+
+        # v7.5: wipe = pool-wide — every account in the tokens collection,
+        # not just the caller's leased key (app: Data controls → Delete all).
+        wipe_res = {"total": 3, "wiped": ["a", "b", "c"], "failed": []}
+        wipe_calls = []
+        async def fake_wipe():
+            wipe_calls.append(1); return wipe_res
+        _bot.POOL.wipe_all_accounts = fake_wipe
+        cleared = []
+        async def fake_clear_all():
+            cleared.append(1); return 2
+        _bot.db.clear_all_sessions = fake_clear_all
+        STATE[OWNER_ID].session_id = "live-sess"
+        STATE[OWNER_ID].session_key = "acc-b"
+        u, q = mk_query("cmd:wipe_ask"); await on_button(u, mk_ctx())
+        ok("wipe ask renders", q.edit_message_text.called)
         u, q = mk_query("cmd:wipe_yes"); await on_button(u, mk_ctx())
-        ok("wipe", md.delete_all_chats.called)
+        ok("wipe calls pool-wide wipe", bool(wipe_calls))
+        ok("wipe clears ALL users' sessions (db)", bool(cleared))
+        st = get_state(OWNER_ID)
+        ok("wipe resets requester session", st.session_id is None
+           and st.session_key is None and st.parent_msg_id is None)
+        ok("wipe reports result", q.edit_message_text.called
+           and "3/3" in (q.edit_message_text.call_args[0][0]
+                         if q.edit_message_text.call_args else ""))
 
     print("\n===== 6. Text streaming + history =====")
     STATE.clear(); _FAKE_TURNS.clear()

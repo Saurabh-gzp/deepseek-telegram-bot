@@ -449,7 +449,9 @@ HELP_TEXT = (
 "👤 Male/Female voice\n"
 "🔗 URL fetch — automatic vs manual\n\n"
 "<b>Chat mgmt:</b>\n"
-"🆕 New · 📁 My Chats · 🗑 Delete · 💥 Wipe · 📤 Export .md\n\n"
+"🆕 New · 📁 My Chats · 🗑 Delete · 📤 Export .md\n"
+"💥 Wipe — deletes cloud chats on ALL pool accounts (app: Data "
+"controls → Delete all chats), incl. every account added later\n\n"
 "<b>Long responses:</b>\n"
 "3800–10000 chars → multi-bubble\n"
 "10000+ → auto .md file\n\n"
@@ -868,23 +870,52 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "cmd:wipe_ask":
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💥 YES", callback_data="cmd:wipe_yes"),
+            InlineKeyboardButton("💥 YES — WIPE ALL", callback_data="cmd:wipe_yes"),
             InlineKeyboardButton("❌ Cancel", callback_data="cmd:refresh"),
         ]])
         try:
+            n_acc = len(await db.list_tokens())
+        except Exception:
+            n_acc = POOL.size
+        try:
             await q.edit_message_text(
-                "⚠️ <b>ALL cloud chats will be permanently deleted.</b>",
+                f"⚠️ <b>Delete all chats on ALL {n_acc} DeepSeek account(s)?</b>\n\n"
+                "Same as the app's <i>Data controls → Delete all chats</i> — but for "
+                "every account in the pool, including any account added later. "
+                "All cloud chats are permanently deleted and every user's chat "
+                "resets to 🆕 New.",
                 parse_mode="HTML", reply_markup=kb)
         except BadRequest: pass
         return
 
     if data == "cmd:wipe_yes":
-        ok = await ds_op(q.from_user.id, 'delete_all_chats')
-        s.session_id = None; s.session_key = None; s.parent_msg_id = None; s.attached_files = []
-        await save_session(q.from_user.id)
+        await q.answer("Wiping every account…")
+        res = await POOL.wipe_all_accounts()
+        # delete_all killed every cloud session on every account — reset all
+        # users' cached pointers so nobody resumes a dead session.
+        await db.clear_all_sessions()
+        for st in STATE.values():
+            st.session_id = None; st.session_key = None
+            st.parent_msg_id = None; st.attached_files = []
         await db.clear_history(q.from_user.id)
-        await q.answer("Wiped" if ok else "Failed", show_alert=True)
-        await send_menu(q, s, edit=True, uid=q.from_user.id); return
+        ok_n, tot = len(res["wiped"]), res["total"]
+        if tot == 0:
+            res_txt = "No DeepSeek accounts in the pool."
+        elif not res["failed"]:
+            res_txt = f"✅ Chats wiped on all {ok_n}/{tot} accounts."
+        else:
+            bad = "\n".join(f"• {l}: {d[:60]}" for l, d in res["failed"][:4])
+            res_txt = f"⚠️ Wiped {ok_n}/{tot} accounts.\nFailed:\n{bad}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🔙 Menu", callback_data="cmd:refresh")]])
+        try:
+            await q.edit_message_text(
+                f"💥 <b>Wipe complete</b>\n\n{res_txt}",
+                parse_mode="HTML", reply_markup=kb)
+        except BadRequest:
+            try: await q.answer(res_txt, show_alert=True)
+            except Exception: pass
+        return
 
     # --- Response actions ---
     if data == "rsp:speak":
@@ -2319,7 +2350,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.4-affinity"
+        version = "v7.5-wipe-all"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:

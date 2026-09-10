@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import db
 from deepseek_client import (DeepSeekClient, login_with_credentials,
@@ -299,6 +299,47 @@ class TokenPool:
             # only return it if the key still exists after a concurrent reload
             if label in self._tokens and self._free is not None:
                 self._free.put_nowait(label)
+
+    async def wipe_all_accounts(self) -> Dict[str, Any]:
+        """
+        App equivalent of Settings → Data controls → Delete all chats — but
+        across EVERY pooled account, not just the caller's current key.
+
+        The bot spreads users over the whole pool, so a user's chats live on
+        several accounts at once; wiping one key leaves the rest dirty. This
+        iterates ALL accounts in the tokens collection (healthy or not — a
+        flagged-but-valid token can still delete its chats) and fires
+        delete_all on each account's own token concurrently. Future accounts
+        are covered automatically because the list comes from the DB.
+
+        Never leases keys (a busy key would block/queue the wipe) — the
+        session auto-recovery added in v7.4 heals any stream that was
+        mid-flight on a wiped account.
+
+        Returns {"total": n, "wiped": [labels], "failed": [(label, reason)]}.
+        """
+        rows = await db.list_tokens()
+        if not rows:
+            return {"total": 0, "wiped": [], "failed": []}
+
+        async def _one(row) -> Tuple[str, bool, str]:
+            label = row["label"]
+            client = self._clients.get(label)
+            if client is None or client.token != row.get("token"):
+                client = DeepSeekClient(row["token"], workdir=self.workdir)
+            try:
+                ok, detail = await asyncio.to_thread(client.delete_all_chats)
+                return label, ok, detail
+            except Exception as e:
+                return label, False, str(e)
+
+        results = await asyncio.gather(*[_one(r) for r in rows])
+        wiped = [lab for lab, ok, _ in results if ok]
+        failed = [(lab, d) for lab, ok, d in results if not ok]
+        log.info("Pool-wide chat wipe: %d/%d accounts wiped%s",
+                 len(wiped), len(rows),
+                 "" if not failed else f" (failed: {[l for l, _ in failed]})")
+        return {"total": len(rows), "wiped": wiped, "failed": failed}
 
     async def would_wait(self) -> bool:
         """True if every key is currently in use (so the caller will queue)."""

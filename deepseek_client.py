@@ -418,6 +418,11 @@ class DeepSeekClient:
             'thinking_enabled': thinking,
             'search_enabled': search,
             'model_type': model_type,
+            # Fields the official app always sends (validated live, HTTP 200):
+            # preempt=false, action=None. Keeping them matches the current
+            # app contract (ChatFullCompletionRequest, APK v2.4.5).
+            'preempt': False,
+            'action': None,
         }
 
         r = requests.post(f"{self.BASE}/chat/completion", headers=h, json=payload,

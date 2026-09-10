@@ -365,7 +365,7 @@ def response_footer_kb(has_text: bool = True) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton("🔊 Speak", callback_data="rsp:speak"),
             InlineKeyboardButton("📄 File", callback_data="rsp:file"),
-            InlineKeyboardButton("🔁 Regen", callback_data="rsp:regen"),
+            InlineKeyboardButton("🔁 Regen", callback_data="rsp:regenmenu"),
         ])
         rows.append([
             InlineKeyboardButton("⚡ Quick actions", callback_data="rsp:actions"),
@@ -376,6 +376,23 @@ def response_footer_kb(has_text: bool = True) -> InlineKeyboardMarkup:
         InlineKeyboardButton("❓ Help", callback_data="cmd:help"),
     ])
     return InlineKeyboardMarkup(rows)
+
+
+def stop_kb() -> InlineKeyboardMarkup:
+    """Shown while DeepSeek is generating (mirrors the app's stop button)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹ Stop", callback_data="rsp:stop")],
+    ])
+
+
+def regen_menu_kb() -> InlineKeyboardMarkup:
+    """Regenerate options — mirrors the app's 'More concise' / 'Add details'."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Fresh retry", callback_data="rsp:regen"),
+         InlineKeyboardButton("✂️ More concise", callback_data="rsp:regen_low")],
+        [InlineKeyboardButton("📖 Add details", callback_data="rsp:regen_high")],
+        [InlineKeyboardButton("🔙 Back", callback_data="rsp:back")],
+    ])
 
 
 def quick_actions_kb() -> InlineKeyboardMarkup:
@@ -416,18 +433,19 @@ HELP_TEXT = (
 "📎 Document — upload + question caption\n"
 "🔗 URL — auto fetch and summarize\n"
 + _YT_HELP_LINE +
-"<b>Modes:</b>\n"
-"🚀 Instant — fast, supports search+files\n"
-"💎 Expert — deep reasoning\n"
-"👁 Vision — images/docs\n\n"
+"<b>Modes (V4.1 era):</b>\n"
+"🚀 Instant — fast daily chat (search+files supported)\n"
+"💎 Expert — deep reasoning for complex tasks (no search/files)\n"
+"👁 Vision — image/document understanding\n\n"
 "<b>Personas 🎭 (9 options):</b>\n"
 "Default, Tutor, Coder, Dost, Writer, Translator, "
 "Comedian, Scientist, Startup Coach, Health Info\n\n"
 "<b>Response buttons (on every reply):</b>\n"
 "🔊 <b>Speak</b> — listen as a voice message\n"
 "📄 <b>File</b> — download as a .md file\n"
-"🔁 <b>Regen</b> — same question, fresh answer\n"
-"⚡ <b>Quick actions</b> — Translate/Summarize/Rephrase/Explain/Continue\n\n"
+"🔁 <b>Regen</b> — retry menu: fresh answer / ✂️ more concise / 📖 more details\n"
+"⚡ <b>Quick actions</b> — Translate/Summarize/Rephrase/Explain/Continue\n"
+"⏹ <b>Stop</b> — appears while generating (also /cancel)\n\n"
 "<b>Toggles:</b>\n"
 "🧠 Think — reasoning chain\n"
 "🌐 Search — real-time web\n"
@@ -909,6 +927,36 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _process_prompt_chat(
             ctx=ctx, chat_id=q.message.chat_id, user_id=q.from_user.id,
             prompt=last['prompt'], reply_to_msg_id=None, is_regen=True,
+        )
+        return
+
+    if data == "rsp:regenmenu":
+        if not LAST.get(q.from_user.id):
+            await q.answer("Nothing to regenerate", show_alert=True); return
+        try:
+            await q.edit_message_reply_markup(reply_markup=regen_menu_kb())
+        except BadRequest: pass
+        return
+
+    if data in ("rsp:regen_low", "rsp:regen_high"):
+        # Mirrors the DeepSeek app's regenerate verbosity options:
+        #   low  = "More concise"  high = "Add details"
+        # (the web API has no verbosity param, so it is emulated via style
+        # instructions appended to the original prompt)
+        last = LAST.get(q.from_user.id)
+        if not last or not last.get('prompt'):
+            await q.answer("Nothing to regenerate", show_alert=True); return
+        await q.answer("Regenerating…")
+        s.parent_msg_id = last.get('parent_before')
+        await save_session(q.from_user.id)
+        style = ("\n\n(IMPORTANT: Answer much more concisely than before — "
+                 "shorter, only the key points.)"
+                 if data == "rsp:regen_low" else
+                 "\n\n(IMPORTANT: Answer in more depth than before — add "
+                 "details, examples and explanations.)")
+        await _process_prompt_chat(
+            ctx=ctx, chat_id=q.message.chat_id, user_id=q.from_user.id,
+            prompt=last['prompt'] + style, reply_to_msg_id=None, is_regen=True,
         )
         return
 
@@ -1871,7 +1919,7 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     if await POOL.would_wait():
         queued = POOL.waiting_count + 1
         initial_label = f"⏳ Analysing your request ...  (Queue: {queued} waiting, {POOL.size} slots busy)"
-    waiter = Waiter(placeholder, initial_label)
+    waiter = Waiter(placeholder, initial_label, kb=stop_kb())
     await waiter.start()
 
     # Background task to update waiter label with live queue position while we wait for a slot
@@ -1961,6 +2009,14 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
       except: pass
       # Ensure waiter shows thinking now that we have a slot
       waiter.update_label("Parsing files, DeepSeek is thinking" if file_ids else "DeepSeek is thinking")
+      # User may have pressed ⏹ Stop while queued in the slot line — bail out
+      # BEFORE firing any DeepSeek request (saves quota, mirrors app behaviour).
+      if user_id in CANCELLED:
+          CANCELLED.discard(user_id)
+          await waiter.stop()
+          await safe_edit(messages[-1], "⏹ <i>Stopped.</i>",
+                          kb=response_footer_kb(has_text=False))
+          return
       try:
           got_any = False
           async for ev in stream_iter(lease.client):
@@ -2039,7 +2095,7 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                       else:
                           txt = "⏳ <i>thinking…</i>"
                   txt = safe_for_telegram(txt, MAX_TG_MSG)
-                  await safe_edit(messages[-1], txt)
+                  await safe_edit(messages[-1], txt, kb=stop_kb())
 
           if not got_any:
               await waiter.stop()
@@ -2186,7 +2242,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.1-fixes"
+        version = "v7.2-app-parity"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:

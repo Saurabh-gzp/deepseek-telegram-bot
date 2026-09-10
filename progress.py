@@ -305,10 +305,12 @@ class Waiter:
         await w.stop()      # caller then edits `placeholder` with the answer
     """
 
-    def __init__(self, msg, label: str = "Processing", interval: float = 2.0):
+    def __init__(self, msg, label: str = "Processing", interval: float = 2.0,
+                 kb=None):
         self.msg = msg
         self.label = label
         self.interval = max(1.2, interval)
+        self.kb = kb  # optional reply_markup (e.g. a Stop button) shown while waiting
         self._task: Optional[asyncio.Task] = None
         self._t0 = time.monotonic()
         self._pct = 0.0
@@ -345,7 +347,8 @@ class Waiter:
                         f"<i>{html.escape(self.label)}{dots}</i>  "
                         f"<i>· ⏱ {elapsed}</i>")
                 try:
-                    await self.msg.edit_text(text, parse_mode="HTML")
+                    await self.msg.edit_text(text, parse_mode="HTML",
+                                             reply_markup=self.kb)
                 except RetryAfter as e:
                     await asyncio.sleep(float(getattr(e, "retry_after", 2)) + 0.5)
                 except BadRequest:

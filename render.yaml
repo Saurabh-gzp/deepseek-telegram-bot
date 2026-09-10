@@ -15,7 +15,7 @@ services:
       - key: OWNER_ID
         sync: false
       - key: WHISPER_SIZE
-        value: small
+        value: base
       - key: ENABLE_HEALTH
         value: "1"
       - key: CONCURRENCY

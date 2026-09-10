@@ -22,6 +22,12 @@ TESTS = [
     ("**bold with `code` inside**", "<b>bold with <code>code</code> inside</b>", "**"),
     ("mix **bold** and *italic*", "<b>bold</b> and <i>italic</i>", "**"),
     ("---", "─────", "---"),
+    # markdown table → aligned monospace <pre>, no raw pipes/markers
+    ("| Name | Age |\n|---|---|\n| Ram | 21 |\n| **Shyam** | 30 |",
+     "<pre>Name", "|---|"),
+    ("| x | y |\n|---|---|\n| 1 | 2 |", "  ", "**"),
+    # pipe-like lines WITHOUT a separator row must stay untouched
+    ("a | b\nc | d", "a | b", "<pre>"),
 ]
 
 PASS = FAIL = 0
@@ -73,4 +79,58 @@ Visit [Python docs](https://docs.python.org) for more.
 > Note: main free hoon!
 """
 print(md_to_tg_html(sample))
+
+print("\n--- split_message (fence-aware long response cut) ---")
+from md2tg import split_message
+
+
+def _sp(name, cond, extra=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  ✅ {name}")
+    else:
+        FAIL += 1
+        print(f"  ❌ {name} {extra}")
+
+
+# 1. fits whole
+h, t = split_message("hello world", 100)
+_sp("short text fits whole", h == "hello world" and t == "", repr((h, t)))
+
+# 2. paragraph boundary preferred
+long = "A" * 50 + "\n\n" + "B" * 50
+h, t = split_message(long, 60)
+_sp("splits at blank line",
+    h == "A" * 50 and t == "B" * 50, repr((h[:20], t[:20])))
+
+# 3. fence straddling the cut → closed in head, re-opened in tail
+fencey = "intro line\n\n```python\n" + "x = 1\n" * 30 + "print('end')\n```\nbye"
+h, t = split_message(fencey, 150)
+_sp("fence closed in head", h.endswith("```") and h.count("```") % 2 == 0,
+    repr(h[-25:]))
+_sp("fence re-opened in tail", t.startswith("```python"), repr(t[:20]))
+_sp("head renders within limit", len(md_to_tg_html(h)) <= 150,
+    f"got {len(md_to_tg_html(h))}")
+
+# 4. expansion-heavy markdown (italic → HTML grows ~2.7x) still fits
+exp = "*word " * 4000
+h, t = split_message(exp, 3800)
+_sp("expansion-heavy head fits",
+    len(md_to_tg_html(h)) <= 3800 and t != "",
+    f"head_html={len(md_to_tg_html(h))}")
+
+# 5. giant single code line → hard cut but fence intact
+giant = "```python\n" + "z" * 9000 + "\n```"
+h, t = split_message(giant, 3800)
+_sp("giant code line cut with fence closed",
+    h.count("```") % 2 == 0 and t.startswith("```python"),
+    repr(h[-10:]))
+
+# 6. table + fence combo renders both
+combo = "| a | b |\n|---|---|\n| 1 | 2 |\n\n```js\nlet x = 1\n```"
+out = md_to_tg_html(combo)
+_sp("table + fence combo", "<pre>a" in out and "language-js" in out, repr(out[:80]))
+
+print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(0 if FAIL == 0 else 1)

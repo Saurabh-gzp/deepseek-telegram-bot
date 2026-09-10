@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV ENABLE_HEALTH=1 \
-    WHISPER_SIZE=small \
+    WHISPER_SIZE=base \
     PORT=10000
 
 EXPOSE 10000

@@ -205,7 +205,11 @@ class TokenPool:
         Detects auth errors and tries auto-refresh. Returns True if refreshed.
         """
         low = error.lower()
-        is_auth = any(x in low for x in ["401", "403", "unauthorized", "authentication", "token", "expired", "session", "login"])
+        # NOTE: "session" must NOT be here — DeepSeek session errors
+        # ("invalid chat session id") are account-scoped state problems,
+        # not auth problems. Treating them as auth errors marked healthy
+        # accounts unhealthy and burned email-login refreshes (v7.6 fix).
+        is_auth = any(x in low for x in ["401", "403", "unauthorized", "authentication", "token", "expired", "login"])
         if not is_auth:
             await db.mark_token(label, healthy=True, error=error[:200])
             return False

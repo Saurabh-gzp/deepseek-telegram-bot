@@ -36,14 +36,15 @@ from typing import Optional, Dict, List
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
                       BotCommand, BotCommandScopeChat, LinkPreviewOptions)
-from telegram.error import BadRequest, Conflict, NetworkError, TimedOut
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters,
 )
 
 from deepseek_client import DeepSeekClient, RULES, login_with_credentials, login_with_credentials_ex
-from md2tg import md_to_tg_html, strip_incomplete_markers, safe_for_telegram
+from md2tg import (md_to_tg_html, strip_incomplete_markers, safe_for_telegram,
+                   split_message)
 from personas import PERSONAS, get_persona, wrap_prompt
 from progress import Progress, Waiter
 from urlfetch import (extract_urls, is_youtube, fetch_url_text,
@@ -1602,8 +1603,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 tmp_path = tmp.name
             await tg_file.download_to_drive(tmp_path)
 
-            await p.step(1, f"Whisper '{os.getenv('WHISPER_SIZE', 'small')}' "
-                            f"model — pehli baar model download hoga (~500MB)")
+            await p.step(1, f"Whisper '{os.getenv('WHISPER_SIZE', 'base')}' "
+                            f"model — pehli baar model download hoga (~150MB)")
             from stt import transcribe
             text, lang = await asyncio.to_thread(transcribe, tmp_path)
         except Exception as e:
@@ -1969,7 +1970,7 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     messages = [placeholder]
     current_text = ""
     last_edit = 0.0
-    edit_interval = 1.3
+    edit_interval = 1.1  # base throttle; long answers stretch (see below)
 
     def stream_iter(lease):
         """Bridge the blocking generator onto the event loop.
@@ -2059,23 +2060,48 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                 yield {'type': 'info', 'msg': 'session_recovered'}
         return _gen()
 
-    async def safe_edit(msg, text: str, kb=None):
-        try:
-            await msg.edit_text(text, parse_mode="HTML",
-                                 link_preview_options=LinkPreviewOptions(is_disabled=True),
-                                 reply_markup=kb)
-        except BadRequest as e:
-            err = str(e).lower()
-            if "not modified" in err: return
-            log.warning("HTML edit failed: %s; falling back to plain", e)
-            plain = re.sub(r"<[^>]+>", "", text)
-            plain = plain.replace("&lt;", "<").replace("&gt;", ">") \
-                         .replace("&amp;", "&").replace("&quot;", '"') \
-                         .replace("&#x27;", "'").replace("▍", "")
+    async def safe_edit(msg, text: str, kb=None) -> bool:
+        """Edit with HTML → plain fallback; honours Telegram flood limits.
+
+        Returns True when the edit landed (or was a no-op), False when the
+        edit was dropped — callers that MUST deliver (final answer) retry.
+        """
+        for attempt in range(2):
             try:
-                await msg.edit_text(plain[:MAX_TG_MSG], reply_markup=kb)
-            except Exception as e2:
-                log.debug("plain fallback: %s", e2)
+                await msg.edit_text(text, parse_mode="HTML",
+                                     link_preview_options=LinkPreviewOptions(is_disabled=True),
+                                     reply_markup=kb)
+                return True
+            except RetryAfter as e:
+                wait = min(float(getattr(e, "retry_after", 1) or 1) + 0.25, 20.0)
+                if attempt == 0:
+                    log.info("Edit flood-limited — sleeping %.1fs", wait)
+                    await asyncio.sleep(wait)
+                    continue
+                log.warning("Edit still flood-limited (%.1fs) — dropping this edit", wait)
+                return False
+            except BadRequest as e:
+                err = str(e).lower()
+                if "not modified" in err:
+                    return True
+                log.warning("HTML edit failed: %s; falling back to plain", e)
+                plain = re.sub(r"<[^>]+>", "", text)
+                plain = plain.replace("&lt;", "<").replace("&gt;", ">") \
+                             .replace("&amp;", "&").replace("&quot;", '"') \
+                             .replace("&#x27;", "'").replace("▍", "")
+                for _attempt2 in range(2):
+                    try:
+                        await msg.edit_text(plain[:MAX_TG_MSG], reply_markup=kb)
+                        return True
+                    except RetryAfter as e2:
+                        wait = min(float(getattr(e2, "retry_after", 1) or 1) + 0.25, 20.0)
+                        log.info("Plain edit flood-limited — sleeping %.1fs", wait)
+                        await asyncio.sleep(wait)
+                    except Exception as e2:
+                        log.debug("plain fallback: %s", e2)
+                        return False
+                return False
+        return False
 
     full_answer = ""
     # Hold a DeepSeek key for the entire stream. N keys => N conversations can
@@ -2191,23 +2217,23 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                   full_answer += ev['text']
 
                   if len(current_text) > MAX_TG_MSG:
-                      cut = MAX_TG_MSG
-                      tail = current_text[:cut]
-                      nl = tail.rfind("\n"); sp = tail.rfind(" ")
-                      if nl > cut - 400: cut = nl
-                      elif sp > cut - 200: cut = sp
-                      sealed = current_text[:cut]
-                      remainder = current_text[cut:].lstrip()
-
-                      sealed_html = safe_for_telegram(md_to_tg_html(sealed), MAX_TG_MSG)
-                      await safe_edit(messages[-1], sealed_html, kb=None)
-                      new_bubble = await ctx.bot.send_message(chat_id=chat_id, text="⏳ …")
-                      messages.append(new_bubble)
-                      current_text = remainder
-                      last_edit = 0.0
+                      # Fence-aware split (v7.6): never leaves a ``` block
+                      # dangling across bubbles — old cut landed mid-code and
+                      # broke rendering for the rest of the answer.
+                      sealed, remainder = split_message(current_text, MAX_TG_MSG)
+                      if remainder and sealed:
+                          sealed_html = safe_for_telegram(md_to_tg_html(sealed), MAX_TG_MSG)
+                          await safe_edit(messages[-1], sealed_html, kb=None)
+                          new_bubble = await ctx.bot.send_message(chat_id=chat_id, text="⏳ …")
+                          messages.append(new_bubble)
+                          current_text = remainder
+                          last_edit = 0.0
 
               now = asyncio.get_event_loop().time()
-              if now - last_edit > edit_interval:
+              # Adaptive throttle: long answers edit a bit slower so Telegram
+              # flood limits never bite mid-stream.
+              interval = edit_interval if len(current_text) < 2500 else 1.8
+              if now - last_edit > interval:
                   last_edit = now
                   if answer_started:
                       partial = strip_incomplete_markers(current_text)
@@ -2218,7 +2244,9 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                       else:
                           txt = "⏳ <i>thinking…</i>"
                   txt = safe_for_telegram(txt, MAX_TG_MSG)
-                  await safe_edit(messages[-1], txt, kb=stop_kb())
+                  if not await safe_edit(messages[-1], txt, kb=stop_kb()):
+                      # flood-limited even after the in-edit retry → pause
+                      last_edit = now + 3.0
 
           if not got_any:
               await waiter.stop()
@@ -2266,8 +2294,12 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
               else:
                   final = md_to_tg_html(current_text) if current_text else "(empty)"
               final = safe_for_telegram(final, MAX_TG_MSG)
-              await safe_edit(messages[-1], final,
-                               kb=response_footer_kb(has_text=answer_started))
+              # The final bubble MUST land — retry harder than a streaming edit.
+              for _ in range(3):
+                  if await safe_edit(messages[-1], final,
+                                     kb=response_footer_kb(has_text=answer_started)):
+                      break
+                  await asyncio.sleep(2.5)
 
           # Auto-TTS if voice_reply is ON
           if s.voice_reply and answer_started and full_answer.strip():
@@ -2365,7 +2397,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.5.1-chats-empty-fix"
+        version = "v7.6-stream-hardening"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:

@@ -1690,10 +1690,17 @@ async def _try_url_summarize(ctx, update, url: str, original_text: str) -> bool:
             await p.step(2, instruction[:70])
         except Exception as e:
             log.warning("URL fetch failed: %s", e)
+            err_txt = html.escape(str(e))
+            extra = ""
+            if "blocking this server" in err_txt or "YT_PROXY" in err_txt:
+                extra = ("\n\n<i>💡 Owner fix: set the <b>YT_PROXY</b> env var "
+                         "on the host (Render → Environment) — cloud IPs are "
+                         "blocked by YouTube.</i>")
             await p.done(
                 f"⚠️ <b>{kind} fetch failed</b>\n\n"
-                f"{html.escape(str(e))[:250]}\n\n"
-                f"<i>Falling back to treating this as a normal question…</i>")
+                f"{err_txt[:400]}\n\n"
+                f"<i>Falling back to treating this as a normal question…</i>"
+                + extra)
             return False
 
     await _process_prompt_chat(

@@ -22,5 +22,13 @@ services:
         value: "8"
       - key: RATE_LIMIT
         value: "20"
+      # YouTube blocks cloud IPs — set these in the Render dashboard if
+      # URL/YouTube summaries fail with "YouTube is blocking requests".
+      # YT_PROXY:    proxy whose exit IP is not a cloud IP (best fix)
+      # YT_COOKIES:  cookies.txt (path / raw content / base64) for yt-dlp
+      - key: YT_PROXY
+        sync: false
+      - key: YT_COOKIES
+        sync: false
     autoDeploy: true
     healthCheckPath: /health

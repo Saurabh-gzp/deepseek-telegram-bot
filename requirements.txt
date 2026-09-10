@@ -10,6 +10,9 @@ av>=11.0.0
 # URL / YouTube fetch
 trafilatura>=1.12
 youtube-transcript-api>=1.0.0
+# yt-dlp = caption fallback when YouTube blocks the server IP (see urlfetch.py)
+yt-dlp>=2025.6.9
+PySocks>=1.7.1
 
 # Health server
 aiohttp>=3.9

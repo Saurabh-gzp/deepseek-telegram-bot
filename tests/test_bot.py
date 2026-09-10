@@ -1,6 +1,8 @@
 """Comprehensive offline tests for bot v4."""
-import asyncio, sys, os
+import asyncio, sys, os, time
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from telegram.error import BadRequest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["STATE_FILE"] = "test_state.json"
@@ -16,6 +18,12 @@ from bot import (STATE, LAST, OWNER_ID, get_state, RULES,
 # runs. install_fakes() then just swaps in the per-test client mock. ---
 from contextlib import asynccontextmanager
 import bot as _bot
+import db as _db_mod
+
+# Real db implementations — _install_stubs() below replaces some of them on
+# the shared module object; section 19 needs the originals back.
+_REAL_ADD_TURN = _db_mod.add_turn
+_REAL_CLEAR_ALL = _db_mod.clear_all_sessions
 
 _FAKE_TURNS = []          # rows record_history() would have written
 _CLIENT = MagicMock()     # current stand-in for a DeepSeekClient
@@ -536,6 +544,167 @@ async def run():
         await on_text(u, mk_ctx())
     ok("last prompt msg id tracked",
        get_state(OWNER_ID).last_prompt_msg_id == 901)
+
+    print("\n===== 19. v7.7.1: draft-bubble fix + history auto-delete protection =====")
+
+    # --- native draft: a draft that was EVER sent must ALWAYS be cleared ---
+    # (old bug: first draft update OK, a later one fails → on=False → clear
+    #  skipped → Telegram kept showing the stuck "..." bubble forever)
+    STATE.clear()
+    draft_calls = []
+    async def draft_fn(**kw):
+        draft_calls.append(kw.get("text"))
+        if len(draft_calls) == 1:
+            return None               # first update lands → draft exists client-side
+        raise BadRequest("flood-ish")  # every later update fails
+    edits = []
+    class B19:
+        message_id = 77
+        async def edit_text(self, text, **kw): edits.append(text)
+    tb19 = B19()
+    ctx = mk_ctx()
+    ctx.bot.send_message_draft = AsyncMock(side_effect=draft_fn)
+    async def _send19(**k): return tb19
+    ctx.bot.send_message = AsyncMock(side_effect=_send19)
+    def gl19(*a, **k):
+        yield {'type': 'msg_id', 'id': 'rd'}
+        yield {'type': 'answer', 'text': 'draft answer text'}
+    md = MagicMock(); install_fakes(md)
+    md.create_chat.return_value = "sd"; md.chat_stream = gl19
+    u = mk_update(text="draft test"); await on_text(u, ctx)
+    ok("draft used during stream", len(draft_calls) >= 1
+       and any(t for t in draft_calls if t))
+    ok("draft ALWAYS cleared at end (no stuck '...')",
+       draft_calls[-1] is None)
+    ok("fallback answer still delivered",
+       any("draft answer text" in e for e in edits))
+
+    # per-chat persistent draft id (stale draft from a dead request stays
+    # reachable/clearable for the next request)
+    from bot import _draft_id_for, DRAFT_IDS
+    id1 = _draft_id_for(OWNER_ID)
+    ok("draft id persistent per chat", _draft_id_for(OWNER_ID) == id1
+       and DRAFT_IDS.get(OWNER_ID) == id1)
+    ok("draft ids bounded map", len(DRAFT_IDS) < 5000)
+
+    # --- db: admins + daily users exempt from auto-delete ---
+    from datetime import datetime, timedelta, timezone
+    class _Cur:
+        def __init__(self, docs): self._d = list(docs)
+        def __aiter__(self): return self
+        async def __anext__(self):
+            if self._d: return self._d.pop(0)
+            raise StopAsyncIteration
+    class _R:
+        def __init__(self, **kw): self.__dict__.update(kw)
+    class _FakeUsers:
+        def __init__(self): self.docs = {}
+        async def find_one(self, q, p=None): return self.docs.get(q["_id"])
+        def find(self, q, p=None):
+            cutoff = q["$or"][1]["last_seen"]["$gte"]
+            return _Cur([d for d in self.docs.values()
+                         if d.get("role") == "admin"
+                         or d.get("last_seen", 0) >= cutoff])
+        async def update_many(self, q, s):
+            nin = q.get("_id", {}).get("$nin", []); n = 0
+            for uid, d in self.docs.items():
+                if uid not in nin:
+                    d.update(s["$set"]); n += 1
+            return _R(modified_count=n)
+    class _FakeHist:
+        def __init__(self): self.rows = []
+        async def insert_one(self, doc): self.rows.append(doc)
+        async def update_many(self, q, s):
+            nin = q["uid"]["$nin"]; n = 0
+            for r in self.rows:
+                if r["uid"] not in nin and "expires_at" not in r:
+                    r["expires_at"] = s["$set"]["expires_at"]; n += 1
+            return _R(modified_count=n)
+        async def delete_many(self, q):
+            nin = q["uid"]["$nin"]; lt = q["expires_at"]["$lt"]
+            keep = [r for r in self.rows
+                    if r["uid"] in nin or "expires_at" not in r
+                    or r["expires_at"] >= lt]
+            deleted = len(self.rows) - len(keep)
+            self.rows = keep
+            return _R(deleted_count=deleted)
+    fu, fh = _FakeUsers(), _FakeHist()
+    orig_dbs = _db_mod._db
+    now = time.time()
+    fu.docs = {
+        1: {"_id": 1, "role": "admin", "last_seen": now - 999999},  # admin (purana bhi)
+        2: {"_id": 2, "role": "user", "last_seen": now - 3600},     # daily user
+        3: {"_id": 3, "role": "user", "last_seen": now - 5 * 86400},# inactive
+    }
+    _db_mod._db = type("DB", (), {"users": fu, "history": fh})()
+    try:
+        await _REAL_ADD_TURN(1, "user", "admin turn")
+        await _REAL_ADD_TURN(2, "user", "daily turn")
+        await _REAL_ADD_TURN(3, "user", "inactive turn")
+        by = {r["text"]: r for r in fh.rows}
+        ok("admin turn: no TTL (never auto-deleted)",
+           "expires_at" not in by["admin turn"])
+        ok("daily-user turn: no TTL",
+           "expires_at" not in by["daily turn"])
+        ok("inactive turn: TTL laga",
+           "expires_at" in by["inactive turn"])
+        prot = await _db_mod.protected_uids()
+        ok("protected = admin + daily-active", set(prot) == {1, 2})
+        # fail-open: DB down → chat KEEP karo, delete mat karo
+        class _Boom:
+            async def find_one(self, *a, **k): raise RuntimeError("db down")
+        _db_mod._db = type("DB", (), {"users": _Boom(), "history": fh})()
+        ok("is_protected fail-open on db error",
+           await _db_mod.is_protected_uid(42) is True)
+        _db_mod._db = type("DB", (), {"users": fu, "history": fh})()
+        # inactive user ka expired turn delete ho, protected kabhi nahi
+        for r in fh.rows:
+            if "expires_at" in r:
+                r["expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=10)
+        removed = await _db_mod.wipe_expired_history(prot)
+        ok("expired inactive turn deleted, protected safe",
+           removed == 1 and len(fh.rows) == 2
+           and all(r["uid"] in (1, 2) for r in fh.rows))
+        det = await _REAL_CLEAR_ALL(protected=prot)
+        ok("session reset skips protected users",
+           det == 1 and "session_id" not in fu.docs[1]
+           and fu.docs[3].get("session_id") is None)
+        # user 2 churn ho gaya → uske immortal turns ko expiry backfill hoti hai
+        fu.docs[2]["last_seen"] = now - 5 * 86400
+        prot2 = await _db_mod.protected_uids()
+        bf = await _db_mod.backfill_turn_expiry(prot2)
+        ok("churned user ke turns ko expiry backfill",
+           bf == 1 and all("expires_at" in r for r in fh.rows if r["uid"] == 2))
+        ok("admin ke turns phir bhi immortal",
+           all("expires_at" not in r for r in fh.rows if r["uid"] == 1))
+    finally:
+        _db_mod._db = orig_dbs
+
+    # --- scheduler: nightly pass protected-aware hai ---
+    import scheduler as sched
+    called = {}
+    async def f_prot(): return [1, 2]
+    async def f_backfill(prot): called["bf"] = list(prot); return 3
+    async def f_wipe(prot): called["wipe"] = list(prot); return 7
+    async def f_clear(protected=None): called["clear"] = list(protected or []); return 5
+    o_p, o_b = _db_mod.protected_uids, _db_mod.backfill_turn_expiry
+    o_w, o_c = _db_mod.wipe_expired_history, _db_mod.clear_all_sessions
+    _db_mod.protected_uids, _db_mod.backfill_turn_expiry = f_prot, f_backfill
+    _db_mod.wipe_expired_history, _db_mod.clear_all_sessions = f_wipe, f_clear
+    sent = {}
+    class _Bot19:
+        async def send_message(self, **k): sent["t"] = str(k.get("text"))
+    try:
+        st = await sched.run_nightly_once(_Bot19(), OWNER_ID)
+    finally:
+        _db_mod.protected_uids, _db_mod.backfill_turn_expiry = o_p, o_b
+        _db_mod.wipe_expired_history, _db_mod.clear_all_sessions = o_w, o_c
+    ok("nightly: protected list wipe+clear tak pahuncha",
+       called.get("wipe") == [1, 2] and called.get("clear") == [1, 2])
+    ok("nightly: stats sahi", st["removed"] == 7 and st["protected"] == 2)
+    ok("nightly: owner report protection batati hai",
+       "safe" in sent.get("t", "").lower()
+       and "protected" in sent.get("t", "").lower())
 
     print(f"\n{'='*50}\nRESULTS: {PASS} passed, {FAIL} failed\n{'='*50}")
     sys.exit(0 if FAIL == 0 else 1)

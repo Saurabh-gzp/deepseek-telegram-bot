@@ -40,6 +40,11 @@ if not MONGO_URL:
 # is the belt-and-braces safety net in case the bot is down at midnight.
 HISTORY_TTL_SECONDS = 24 * 3600
 
+# Users seen within this window are "daily users": their stored chats are
+# NEVER auto-deleted (no TTL, nightly wipe skips them). Admins are exempt
+# unconditionally.
+ACTIVE_WINDOW_SECONDS = 24 * 3600
+
 _client: Optional[AsyncIOMotorClient] = None
 _db = None
 
@@ -199,6 +204,36 @@ async def count_users(status: Optional[str] = None) -> int:
 async def all_active_ids() -> List[int]:
     cur = _db.users.find({"status": ACTIVE}, {"_id": 1})
     return [d["_id"] async for d in cur]
+
+
+async def is_protected_uid(uid: int) -> bool:
+    """True for admins and daily-active users — their chats never auto-expire.
+
+    Fail-open on DB errors: better to keep a chat than lose it.
+    """
+    try:
+        doc = await _db.users.find_one({"_id": uid}, {"role": 1, "last_seen": 1})
+    except Exception:
+        return True
+    if not doc:
+        return False
+    if doc.get("role") == "admin":
+        return True
+    return (_now() - (doc.get("last_seen") or 0)) < ACTIVE_WINDOW_SECONDS
+
+
+async def protected_uids(window: int = ACTIVE_WINDOW_SECONDS) -> List[int]:
+    """uids whose history must survive auto-cleanup: admins + recently seen."""
+    cutoff = _now() - window
+    out: List[int] = []
+    try:
+        cur = _db.users.find(
+            {"$or": [{"role": "admin"}, {"last_seen": {"$gte": cutoff}}]},
+            {"_id": 1})
+        out = [d["_id"] async for d in cur]
+    except Exception:
+        out = []
+    return out
 
 
 async def global_stats() -> Dict[str, Any]:
@@ -457,13 +492,14 @@ async def set_token_last_check(label: str, healthy: bool = True) -> None:
 
 async def add_turn(uid: int, role: str, text: str) -> None:
     now = _now()
-    await _db.history.insert_one({
-        "uid": uid,
-        "role": role,
-        "text": text[:20000],
-        "ts": now,
-        "expires_at": _mongo_dt(now + HISTORY_TTL_SECONDS),
-    })
+    row: Dict[str, Any] = {"uid": uid, "role": role,
+                           "text": text[:20000], "ts": now}
+    # Admins and daily-active users are exempt from the 24h TTL — their
+    # chats are never auto-deleted. (The nightly job backfills an expiry on
+    # these rows only if the user later goes inactive.)
+    if not await is_protected_uid(uid):
+        row["expires_at"] = _mongo_dt(now + HISTORY_TTL_SECONDS)
+    await _db.history.insert_one(row)
 
 
 def _mongo_dt(epoch: float):
@@ -484,23 +520,53 @@ async def clear_history(uid: int) -> int:
 
 
 async def wipe_all_history() -> int:
-    """Nightly reset: drop every stored turn and detach every DeepSeek session."""
+    """Legacy full reset — drops EVERY turn (use only for explicit wipes).
+    The nightly cleanup now uses protected_uids()/wipe_expired_history()."""
     r = await _db.history.delete_many({})
     await clear_all_sessions()
     return r.deleted_count
 
 
-async def clear_all_sessions() -> int:
+async def backfill_turn_expiry(protected: List[int],
+                               ttl_s: int = HISTORY_TTL_SECONDS) -> int:
+    """Give immortal rows of now-inactive users an expiry.
+
+    Turns written while a user was active (protected) carry no expires_at.
+    Once the user stops showing up, the nightly job stamps them so Mongo's
+    TTL clears the stale history too — admins/daily users stay untouched.
     """
-    Detach EVERY user's cached DeepSeek session pointer.
+    if not protected:
+        return 0
+    r = await _db.history.update_many(
+        {"uid": {"$nin": protected}, "expires_at": {"$exists": False}},
+        {"$set": {"expires_at": _mongo_dt(_now() + ttl_s)}})
+    return r.modified_count
+
+
+async def wipe_expired_history(protected: List[int]) -> int:
+    """Delete only inactive users' already-expired turns (never protected)."""
+    r = await _db.history.delete_many(
+        {"uid": {"$nin": protected}, "expires_at": {"$lt": _mongo_dt(_now())}})
+    return r.deleted_count
+
+
+async def clear_all_sessions(protected: Optional[List[int]] = None) -> int:
+    """
+    Detach users' cached DeepSeek session pointers.
 
     Needed after a pool-wide chat wipe: delete_all on all accounts kills every
     cloud session at once, so all cached session_id/parent_msg_id pairs become
     stale. Resetting them up-front means users get a clean session on their
     next message instead of relying on stale-session auto-recovery.
+
+    `protected` (admins + daily-active users) keeps its session pointers —
+    their chats/continuity are preserved; stale ones self-heal anyway.
     """
+    q: Dict[str, Any] = {}
+    if protected:
+        q = {"_id": {"$nin": protected}}
     r = await _db.users.update_many(
-        {},
+        q,
         {"$set": {"session_id": None, "session_key": None,
                   "parent_msg_id": None, "attached_files": []}})
     return r.modified_count

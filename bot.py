@@ -522,11 +522,28 @@ def _think_block_html(think_buf: str, room: int) -> str:
 
 
 async def record_history(uid: int, role: str, text: str):
-    """Store one turn. Rows carry a 24h TTL and are wiped nightly."""
+    """Store one turn. Auto-expiry (24h TTL + nightly wipe) skips admins and
+    daily-active users — their chats are never deleted automatically."""
     try:
         await db.add_turn(uid, role, text)
     except Exception as e:
         log.warning("history write failed: %s", e)
+
+
+# ---------- Native draft state ----------
+# Draft ids are PERSISTENT per chat: if a request dies mid-stream (crash,
+# restart, network loss) its leftover draft bubble would otherwise be
+# un-clearable — the next request reuses the same id, so its first draft
+# update overwrites the stale bubble and a clear can always reach it.
+DRAFT_IDS: Dict[int, int] = {}
+
+
+def _draft_id_for(chat_id: int) -> int:
+    if chat_id not in DRAFT_IDS:
+        if len(DRAFT_IDS) > 2000:          # bound the map
+            DRAFT_IDS.pop(next(iter(DRAFT_IDS)))
+        DRAFT_IDS[chat_id] = secrets.randbits(24)
+    return DRAFT_IDS[chat_id]
 
 
 # ---------- Rate limiting ----------
@@ -2053,39 +2070,73 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     messages = [placeholder]
     current_text = ""
     last_edit = 0.0
-    edit_interval = 1.1  # base throttle; long answers stretch (see below)
+    edit_interval = 1.0  # base throttle; long answers stretch a bit (snappier realtime feel)
 
     # --- native draft streaming (Bot API sendMessageDraft, PTB 22.8+) ---
     # Telegram clients render a live "draft" bubble natively; we mirror the
     # stream into it and keep the anchor bubble quiet. Any failure (old
     # client, flood, unsupported method) silently falls back to the classic
     # placeholder-edit streaming.
+    #
+    # Reliability contract (v7.7.1): a draft that was EVER sent must be
+    # cleared when the request ends — no matter how many updates failed in
+    # between. Otherwise Telegram keeps showing the stuck "..." typing
+    # bubble forever. Hence the `ever` flag + RetryAfter-aware clear +
+    # background retry safety net, all on a persistent per-chat draft id.
     native_enabled = os.getenv("NATIVE_STREAM", "1") == "1"
-    nat = {"tried": False, "on": False, "id": 0}
+    nat = {"tried": False, "on": False, "ever": False, "cleared": False,
+           "id": _draft_id_for(chat_id)}
     quiet = [False]
 
     async def native_draft(html_text: str):
         if not native_enabled:
             return
-        if not nat["tried"]:
-            nat["tried"] = True
-            nat["id"] = secrets.randbits(24)
+        nat["tried"] = True
         try:
             await ctx.bot.send_message_draft(chat_id=chat_id,
                                              draft_id=nat["id"],
                                              text=html_text, parse_mode="HTML")
             nat["on"] = True
+            nat["ever"] = True          # a draft now exists client-side
+            nat["cleared"] = False
         except Exception:
-            nat["on"] = False   # unsupported here → classic edit streaming
+            # This update failed → fall back to classic edit streaming, but
+            # the client may still hold an earlier draft: `ever` stays True
+            # so native_draft_clear() below still runs.
+            nat["on"] = False
 
     async def native_draft_clear():
-        on = nat["on"]
-        nat["on"] = False
-        if not on:
+        """Guaranteed draft removal — the anti stuck-'...' guarantee."""
+        if nat["cleared"] or not nat["ever"]:
             return
+        nat["cleared"] = True
+        nat["on"] = False
+        for attempt in range(2):
+            try:
+                await ctx.bot.send_message_draft(chat_id=chat_id,
+                                                 draft_id=nat["id"], text=None)
+                return
+            except RetryAfter as e:
+                wait = min(float(getattr(e, "retry_after", 1) or 1) + 0.25, 4.0)
+                if attempt == 0 and wait <= 2.5:
+                    await asyncio.sleep(wait)
+                    continue
+            except Exception:
+                break
+        # Background safety net: keep retrying quietly for ~30s so the
+        # bubble disappears even if Telegram was flood-limiting us.
+        async def _bg_clear():
+            for _ in range(6):
+                await asyncio.sleep(5.0)
+                try:
+                    await ctx.bot.send_message_draft(chat_id=chat_id,
+                                                     draft_id=nat["id"],
+                                                     text=None)
+                    return
+                except Exception:
+                    continue
         try:
-            await ctx.bot.send_message_draft(chat_id=chat_id,
-                                             draft_id=nat["id"], text=None)
+            asyncio.create_task(_bg_clear())
         except Exception:
             pass
 
@@ -2349,7 +2400,7 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
               now = asyncio.get_event_loop().time()
               # Adaptive throttle: long answers edit a bit slower so Telegram
               # flood limits never bite mid-stream.
-              interval = edit_interval if len(current_text) < 2500 else 1.8
+              interval = edit_interval if len(current_text) < 2500 else 1.6
               if now - last_edit > interval:
                   last_edit = now
                   if answer_started:
@@ -2539,7 +2590,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.7-app-parity"
+        version = "v7.7.1-draft-fix"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:

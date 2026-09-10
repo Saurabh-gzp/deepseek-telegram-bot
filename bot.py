@@ -285,17 +285,14 @@ def _parse_email_account_input(text: str):
 
 # ---------- UI ----------
 def status_text(s: UserState) -> str:
-    r = RULES[s.model_type]
     p = get_persona(s.persona)
     think = "ON" if s.thinking else "OFF"
-    if not r['supports_search']: search = "BLOCKED"
-    elif s.search and not s.attached_files: search = "ON"
-    else: search = "OFF"
+    search = "ON" if (s.search and not s.attached_files) else "OFF"
     sess = (s.session_id[:8] + "…") if s.session_id else "none"
 
     lines = [
         f"🤖 <b>DeepSeek Bot</b> · <i>{p['emoji']} {p['name']}</i>",
-        f"{r['emoji']} Mode: <b>{r['name']}</b>  |  🧠 Think: <b>{think}</b>  |  🌐 Search: <b>{search}</b>",
+        f"🧠 Think: <b>{think}</b>  |  🌐 Search: <b>{search}</b>",
         f"🔊 Voice: <b>{'ON' if s.voice_reply else 'OFF'}</b> ({'♀' if s.tts_female else '♂'})  |  🔗 URL fetch: <b>{'ON' if s.auto_urls else 'OFF'}</b>",
         f"🆔 Session: <code>{sess}</code>",
     ]
@@ -308,13 +305,9 @@ def status_text(s: UserState) -> str:
 
 
 def main_menu_kb(s: UserState, uid: int = 0) -> InlineKeyboardMarkup:
+    # DeepSeek removed Instant/Expert/Vision modes — new app UI is a single
+    # direct chat with Think + Search toggles (like the official app now).
     rows = [
-        [InlineKeyboardButton(f"{'🟢' if s.model_type=='default' else '⚪'} Instant",
-                              callback_data="mode:default"),
-         InlineKeyboardButton(f"{'🟢' if s.model_type=='expert' else '⚪'} Expert",
-                              callback_data="mode:expert"),
-         InlineKeyboardButton(f"{'🟢' if s.model_type=='vision' else '⚪'} Vision",
-                              callback_data="mode:vision")],
         [InlineKeyboardButton(f"🧠 Think: {'ON' if s.thinking else 'OFF'}",
                               callback_data="toggle:think"),
          InlineKeyboardButton(f"🌐 Search: {'ON' if s.search else 'OFF'}",
@@ -433,10 +426,10 @@ HELP_TEXT = (
 "📎 Document — upload + question caption\n"
 "🔗 URL — auto fetch and summarize\n"
 + _YT_HELP_LINE +
-"<b>Modes (V4.1 era):</b>\n"
-"🚀 Instant — fast daily chat (search+files supported)\n"
-"💎 Expert — deep reasoning for complex tasks (no search/files)\n"
-"👁 Vision — image/document understanding\n\n"
+"<b>Model (new DeepSeek era):</b>\n"
+"⚡ One direct model — Instant/Expert/Vision modes are removed\n"
+"   (same as the official app). 🧠 Think + 🌐 Search toggles\n"
+"   control reasoning and web access.\n\n"
 "<b>Personas 🎭 (9 options):</b>\n"
 "Default, Tutor, Coder, Dost, Writer, Translator, "
 "Comedian, Scientist, Startup Coach, Health Info\n\n"
@@ -706,14 +699,11 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- mode/toggles ---
+    # Legacy mode: buttons (Instant/Expert/Vision) removed in the new DeepSeek
+    # app. If an old keyboard is still on screen, just refresh the menu.
     if data.startswith("mode:"):
-        m = data.split(":", 1)[1]
-        if m in RULES:
-            s.model_type = m
-            r = RULES[m]
-            if not r['supports_search']: s.search = False
-            if not r['supports_files']: s.attached_files = []
-            await save_settings(q.from_user.id)
+        s.model_type = 'default'
+        await save_settings(q.from_user.id)
         await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     if data == "toggle:think":
@@ -726,8 +716,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s.auto_urls = not s.auto_urls; await save_settings(q.from_user.id); await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     if data == "toggle:search":
-        if not RULES[s.model_type]['supports_search']:
-            await q.answer("Search blocked in this mode", show_alert=True); return
         if s.attached_files:
             await q.answer("Files attached — detach first", show_alert=True); return
         s.search = not s.search; await save_settings(q.from_user.id); await send_menu(q, s, edit=True, uid=q.from_user.id); return
@@ -784,7 +772,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Chars sent: <b>{s.total_chars_in:,}</b>\n"
             f"Chars received: <b>{s.total_chars_out:,}</b>\n"
             f"Persona: <b>{get_persona(s.persona)['name']}</b>\n"
-            f"Mode: <b>{RULES[s.model_type]['name']}</b>\n"
             f"Stored turns: <b>{len(await db.get_history(q.from_user.id, limit=500))}</b> "
             f"<i>(cleared nightly)</i>"
         )
@@ -1604,16 +1591,6 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_state(update.effective_user.id)
     msg = update.message
 
-    if not RULES[s.model_type]['supports_files']:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("→ Instant", callback_data="mode:default"),
-            InlineKeyboardButton("→ Vision", callback_data="mode:vision"),
-        ]])
-        await msg.reply_html(
-            f"❌ Files not supported in <b>{RULES[s.model_type]['name']}</b> mode.",
-            reply_markup=kb)
-        return
-
     doc = msg.document or (msg.photo[-1] if msg.photo else None)
     if not doc: return
 
@@ -1892,8 +1869,10 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
 
     parent_before = s.parent_msg_id
     thinking_on = bool(s.thinking)
-    search_on = bool(s.search) and RULES[s.model_type]['supports_search']
-    mode = s.model_type
+    # DeepSeek removed modes (Instant/Expert/Vision) — one direct model now.
+    # Verified live: backend silently coerces any model_type to "default".
+    search_on = bool(s.search)
+    mode = 'default'
     file_ids = [f[0] for f in s.attached_files]
 
     # Wrap with persona
@@ -1946,18 +1925,56 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     edit_interval = 1.3
 
     def stream_iter(client):
-        """Bridge the blocking generator onto the event loop."""
+        """Bridge the blocking generator onto the event loop.
+
+        DeepSeek backend migrations / 3-day session TTL can invalidate our
+        cached chat session ("invalid chat session id"). When that happens
+        on the first attempt, transparently create a fresh session and
+        restart the stream once — the user just gets their answer.
+        """
         async def _gen():
             loop = asyncio.get_event_loop()
-            gen = client.chat_stream(
-                s.session_id, s.parent_msg_id, final_prompt,
-                model_type=mode, thinking=thinking_on, search=search_on,
-                file_ids=file_ids,
-            )
-            while True:
-                ev = await loop.run_in_executor(None, next, gen, None)
-                if ev is None: break
-                yield ev
+            for attempt in range(2):
+                gen = client.chat_stream(
+                    s.session_id, s.parent_msg_id, final_prompt,
+                    model_type=mode, thinking=thinking_on, search=search_on,
+                    file_ids=file_ids,
+                )
+                stale_err = None
+                yielded_any = False
+                while True:
+                    ev = await loop.run_in_executor(None, next, gen, None)
+                    if ev is None: break
+                    low = (ev.get('msg') or '').lower() if isinstance(ev, dict) else ''
+                    if (attempt == 0 and not yielded_any
+                            and isinstance(ev, dict) and ev.get('type') == 'error'
+                            and ('invalid chat session' in low
+                                 or ('session' in low
+                                     and ('invalid' in low or 'not found' in low)))):
+                        stale_err = ev
+                        break
+                    yielded_any = True
+                    yield ev
+                if stale_err is None:
+                    return
+                # Heal: fresh session, reset parent, retry once
+                nsid = await ds_op(user_id, 'create_chat')
+                if not nsid:
+                    yield stale_err
+                    return
+                s.session_id = nsid
+                s.parent_msg_id = None
+                try:
+                    await save_session(user_id)
+                except Exception:
+                    pass
+                try:
+                    gen.close()
+                except Exception:
+                    pass
+                log.info("Stale DeepSeek session healed -> new session %s (user %s)",
+                         nsid[:8], user_id)
+                yield {'type': 'info', 'msg': 'session_recovered'}
         return _gen()
 
     async def safe_edit(msg, text: str, kb=None):
@@ -2035,10 +2052,25 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
               got_any = True
               if ev['type'] == 'msg_id':
                   s.parent_msg_id = ev['id']; continue
+              if ev['type'] == 'info':
+                  # Session was auto-recovered mid-stream — reset buffers so
+                  # no stale partial text leaks into the new answer.
+                  think_buf = ""; current_text = ""; full_answer = ""
+                  answer_started = False
+                  continue
               if ev['type'] == 'error':
                   err_msg = ev['msg']
+                  err_low = err_msg.lower()
+                  # Stale-session errors are normally auto-recovered inside
+                  # stream_iter; reaching here means recovery failed. Do NOT
+                  # blame the account/token for a dead session id.
+                  is_session_err = ('invalid chat session' in err_low
+                                    or ('session' in err_low
+                                        and ('invalid' in err_low or 'not found' in err_low)))
                   # Try auto-refresh if it's an auth/token error and account has email
-                  is_auth_err = any(x in err_msg.lower() for x in ["401","403","unauthorized","token","expired","session","auth"])
+                  is_auth_err = (not is_session_err) and any(
+                      x in err_low for x in
+                      ["401","403","unauthorized","token","expired","auth"])
                   if is_auth_err and lease:
                       try:
                           # Attempt refresh via pool
@@ -2242,7 +2274,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.2-app-parity"
+        version = "v7.3-direct"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:

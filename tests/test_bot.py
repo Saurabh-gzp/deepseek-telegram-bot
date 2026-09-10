@@ -172,11 +172,18 @@ async def run():
     u, q = mk_query("personas:0"); await on_button(u, mk_ctx())
     ok("persona menu opens", q.edit_message_text.called)
 
-    print("\n===== 4. Modes =====")
+    print("\n===== 4. Modes (removed in new DeepSeek app) =====")
     STATE.clear()
+    # DeepSeek removed Instant/Expert/Vision — legacy mode: callbacks must
+    # land on 'default' and the menu must show Think/Search, no mode buttons.
     for m in ["expert", "vision", "default"]:
         u, q = mk_query(f"mode:{m}"); await on_button(u, mk_ctx())
-        ok(f"mode → {m}", get_state(OWNER_ID).model_type == m)
+        ok(f"legacy mode:{m} → default", get_state(OWNER_ID).model_type == "default")
+    kb = bot.main_menu_kb(get_state(OWNER_ID), OWNER_ID)
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    ok("no mode buttons", not any("Instant" in l or "Expert" in l or "Vision" in l for l in labels))
+    ok("Think toggle present", any("Think" in l for l in labels))
+    ok("Search toggle present", any("Search" in l for l in labels))
 
     print("\n===== 5. Session mgmt (mocked) =====")
     STATE.clear()

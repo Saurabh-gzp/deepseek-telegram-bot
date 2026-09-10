@@ -47,6 +47,7 @@ class TokenPool:
         self._passwords: Dict[str, str] = {}            # label -> password
         self._auth_types: Dict[str, str] = {}          # label -> auth_type
         self._busy: Dict[str, int] = {}                 # label -> uid
+        self._pref: Dict[int, str] = {}                 # uid -> last-used label (session affinity)
         self._waiters: int = 0
         self._lock = asyncio.Lock()
 
@@ -260,6 +261,34 @@ class TokenPool:
             return
         finally:
             self._waiters = max(0, self._waiters - 1)
+
+        # Session affinity: a DeepSeek chat session is only valid on the
+        # account that created it. Handing a user a different key than last
+        # time would break their cached session ("invalid chat session id").
+        # So when this user's previous key is free right now, swap it in
+        # (never preempting a busy key — FIFO order keeps fairness).
+        pref = self._pref.get(uid)
+        if pref and pref != label and pref in self._tokens and not self._free.empty():
+            drained = []
+            found = False
+            while not self._free.empty():
+                try:
+                    lab = self._free.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if lab == pref:
+                    found = True
+                    break
+                drained.append(lab)
+            if found:
+                self._free.put_nowait(label)   # give the FIFO pick back
+                label = pref
+            for lab in drained:
+                self._free.put_nowait(lab)
+
+        self._pref[uid] = label
+        if len(self._pref) > 1000:  # bounded memory
+            self._pref.pop(next(iter(self._pref)), None)
 
         self._busy[label] = uid
         try:

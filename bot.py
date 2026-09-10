@@ -111,6 +111,7 @@ PENDING_NOTIFIED: Dict[int, bool] = {}
 @dataclass
 class UserState:
     session_id: Optional[str] = None
+    session_key: Optional[str] = None   # pool label (account) that owns session_id
     parent_msg_id: Optional[str] = None
     model_type: str = "default"
     thinking: bool = False
@@ -146,6 +147,7 @@ def _state_from_doc(doc: dict) -> UserState:
         if hasattr(st, k):
             setattr(st, k, v)
     st.session_id = doc.get("session_id")
+    st.session_key = doc.get("session_key")
     st.parent_msg_id = doc.get("parent_msg_id")
     st.attached_files = doc.get("attached_files") or []
     st.msg_count = doc.get("msg_count", 0)
@@ -182,6 +184,7 @@ async def save_session(uid: int) -> None:
     if not st:
         return
     await db.set_user_field(uid, session_id=st.session_id,
+                            session_key=st.session_key,
                             parent_msg_id=st.parent_msg_id,
                             attached_files=st.attached_files)
 
@@ -756,11 +759,11 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Detached"); await send_menu(q, s, edit=True, uid=q.from_user.id); return
 
     if data == "cmd:new":
-        sid = await ds_op(q.from_user.id, 'create_chat')
-        if sid:
-            s.session_id = sid; s.parent_msg_id = None; s.attached_files = []
-            await save_session(q.from_user.id); await q.answer("New chat started")
-        else: await q.answer("Failed", show_alert=True)
+        # Lazy: no API call here. The session is created on the account that
+        # actually streams the first message (see stream_iter) — creating it
+        # via a random pool key caused cross-account "invalid chat session id".
+        s.session_id = None; s.session_key = None; s.parent_msg_id = None; s.attached_files = []
+        await save_session(q.from_user.id); await q.answer("New chat started")
         try: await send_menu(q, s, edit=True, uid=q.from_user.id)
         except: await q.message.reply_html(status_text(s), reply_markup=main_menu_kb(s, q.from_user.id))
         return
@@ -830,6 +833,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("Out of range", show_alert=True); return
         c = chats[idx]
         s.session_id = c['id']
+        s.session_key = None   # owner account unknown — stale-healer will fix if wrong
         hist = await ds_op(q.from_user.id, 'get_history', c['id'])
         last = hist[1] if hist else None
         s.parent_msg_id = last
@@ -857,7 +861,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if s.session_id:
             ok = await ds_op(q.from_user.id, 'delete_chat', s.session_id)
             if ok:
-                s.session_id = None; s.parent_msg_id = None; s.attached_files = []
+                s.session_id = None; s.session_key = None; s.parent_msg_id = None; s.attached_files = []
                 await save_session(q.from_user.id); await q.answer("Deleted")
             else: await q.answer("Failed", show_alert=True)
         await send_menu(q, s, edit=True, uid=q.from_user.id); return
@@ -876,7 +880,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "cmd:wipe_yes":
         ok = await ds_op(q.from_user.id, 'delete_all_chats')
-        s.session_id = None; s.parent_msg_id = None; s.attached_files = []
+        s.session_id = None; s.session_key = None; s.parent_msg_id = None; s.attached_files = []
         await save_session(q.from_user.id)
         await db.clear_history(q.from_user.id)
         await q.answer("Wiped" if ok else "Failed", show_alert=True)
@@ -1860,12 +1864,9 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                                       is_quick_action: bool = False):
     s = get_state(user_id)
 
-    if not s.session_id:
-        sid = await ds_op(user_id, 'create_chat')
-        if not sid:
-            await ctx.bot.send_message(chat_id=chat_id, text="❌ Session creation failed")
-            return
-        s.session_id = sid; s.parent_msg_id = None; await save_session(user_id)
+    # NOTE: no session creation here on purpose. A DeepSeek session only
+    # works on the account that created it, so it must be created by the
+    # SAME pool key that later streams the answer (see stream_iter).
 
     parent_before = s.parent_msg_id
     thinking_on = bool(s.thinking)
@@ -1924,16 +1925,43 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     last_edit = 0.0
     edit_interval = 1.3
 
-    def stream_iter(client):
+    def stream_iter(lease):
         """Bridge the blocking generator onto the event loop.
 
-        DeepSeek backend migrations / 3-day session TTL can invalidate our
-        cached chat session ("invalid chat session id"). When that happens
-        on the first attempt, transparently create a fresh session and
-        restart the stream once — the user just gets their answer.
+        Session ownership rules (all on the SAME account as this lease):
+        - cached session from another pooled account -> dropped, fresh one
+        - no cached session                          -> created on lease client
+        - stale/invalid session (backend TTL/migration) -> healed with a new
+          session created on the lease client, then retried once
         """
+        client = lease.client
+
         async def _gen():
             loop = asyncio.get_event_loop()
+            # A session id is account-scoped: a cached one from another key
+            # would fail with "invalid chat session id". If we know the owner
+            # and it differs from this lease, drop it up front.
+            if s.session_id and s.session_key and s.session_key != lease.label:
+                log.info("Session %s owned by %s, streaming on %s — starting fresh",
+                         s.session_id[:8], s.session_key, lease.label)
+                s.session_id = None
+                s.parent_msg_id = None
+            if not s.session_id:
+                try:
+                    nsid = await loop.run_in_executor(None, client.create_chat)
+                except Exception as e:
+                    log.warning("create_chat failed: %s", e)
+                    nsid = None
+                if not nsid:
+                    yield {'type': 'error', 'msg': 'Could not start a new chat — please try again'}
+                    return
+                s.session_id = nsid
+                s.parent_msg_id = None
+                s.session_key = lease.label
+                try:
+                    await save_session(user_id)
+                except Exception:
+                    pass
             for attempt in range(2):
                 gen = client.chat_stream(
                     s.session_id, s.parent_msg_id, final_prompt,
@@ -1957,13 +1985,21 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                     yield ev
                 if stale_err is None:
                     return
-                # Heal: fresh session, reset parent, retry once
-                nsid = await ds_op(user_id, 'create_chat')
+                # Heal on the SAME account as this lease (a fresh session from
+                # a different key would be invalid again).
+                log.info("Stale DeepSeek session %s — healing on key %s (user %s)",
+                         s.session_id[:8], lease.label, user_id)
+                try:
+                    nsid = await loop.run_in_executor(None, client.create_chat)
+                except Exception as e:
+                    log.warning("heal create_chat failed: %s", e)
+                    nsid = None
                 if not nsid:
                     yield stale_err
                     return
                 s.session_id = nsid
                 s.parent_msg_id = None
+                s.session_key = lease.label
                 try:
                     await save_session(user_id)
                 except Exception:
@@ -2036,7 +2072,7 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
           return
       try:
           got_any = False
-          async for ev in stream_iter(lease.client):
+          async for ev in stream_iter(lease):
               if user_id in CANCELLED:
                   CANCELLED.discard(user_id)
                   await waiter.stop()
@@ -2051,7 +2087,16 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                   await waiter.stop()
               got_any = True
               if ev['type'] == 'msg_id':
-                  s.parent_msg_id = ev['id']; continue
+                  s.parent_msg_id = ev['id']
+                  # Adopt: remember which account owns this session (only
+                  # reached on a successful stream, so the mapping is trusted).
+                  if s.session_key != lease.label:
+                      s.session_key = lease.label
+                      try:
+                          await save_session(user_id)
+                      except Exception:
+                          pass
+                  continue
               if ev['type'] == 'info':
                   # Session was auto-recovered mid-stream — reset buffers so
                   # no stale partial text leaks into the new answer.
@@ -2274,7 +2319,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.3-direct"
+        version = "v7.4-affinity"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:

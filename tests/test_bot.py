@@ -196,7 +196,10 @@ async def run():
         md.delete_all_chats.return_value = True
 
         u, q = mk_query("cmd:new"); await on_button(u, mk_ctx())
-        ok("new chat", get_state(OWNER_ID).session_id == "sess-1")
+        # v7.4: cmd:new is a lazy state reset — session is created later by the
+        # streaming account itself (cross-account sessions were invalid).
+        ok("new chat (lazy reset)", get_state(OWNER_ID).session_id is None
+           and get_state(OWNER_ID).session_key is None)
         u, q = mk_query("chats:0"); c = mk_ctx(); await on_button(u, c)
         ok("chats list", c.user_data.get('chat_list'))
         u, q = mk_query("switch:0"); c = mk_ctx()

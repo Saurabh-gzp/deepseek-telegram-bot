@@ -2083,7 +2083,14 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
     # between. Otherwise Telegram keeps showing the stuck "..." typing
     # bubble forever. Hence the `ever` flag + RetryAfter-aware clear +
     # background retry safety net, all on a persistent per-chat draft id.
-    native_enabled = os.getenv("NATIVE_STREAM", "1") == "1"
+    # NATIVE_STREAM is OFF by default (v7.7.2): the native draft bubble needs
+    # an explicit sendMessageDraft clear to know the answer finished — under
+    # Telegram flood limits that clear (and the final buttons edit) gets
+    # delayed, so users saw a stuck "..." bubble and late action buttons.
+    # Classic anchor streaming (text grows in the answer bubble itself) gives
+    # the same realtime feel with zero phantom bubbles. Set NATIVE_STREAM=1
+    # to opt back into the draft-bubble experiment (v7.7.1 safety nets apply).
+    native_enabled = os.getenv("NATIVE_STREAM", "0") == "1"
     nat = {"tried": False, "on": False, "ever": False, "cleared": False,
            "id": _draft_id_for(chat_id)}
     quiet = [False]
@@ -2590,7 +2597,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.7.1-draft-fix"
+        version = "v7.7.2-draft-off"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:

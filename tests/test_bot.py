@@ -571,13 +571,44 @@ async def run():
         yield {'type': 'answer', 'text': 'draft answer text'}
     md = MagicMock(); install_fakes(md)
     md.create_chat.return_value = "sd"; md.chat_stream = gl19
-    u = mk_update(text="draft test"); await on_text(u, ctx)
-    ok("draft used during stream", len(draft_calls) >= 1
+    u = mk_update(text="draft test")
+    with patch.dict(os.environ, {"NATIVE_STREAM": "1"}):   # opt-in mode
+        await on_text(u, ctx)
+    ok("draft used during stream (opt-in mode)", len(draft_calls) >= 1
        and any(t for t in draft_calls if t))
     ok("draft ALWAYS cleared at end (no stuck '...')",
        draft_calls[-1] is None)
     ok("fallback answer still delivered",
        any("draft answer text" in e for e in edits))
+
+    # --- default: NATIVE_STREAM OFF — no draft bubble at all ---
+    # (the draft bubble needs an explicit clear call to know the answer
+    #  finished; under flood it lingers as a stuck "..." and delays buttons.
+    #  Classic streaming puts the live text IN the answer bubble instead.)
+    STATE.clear()
+    draft_calls2 = []
+    async def draft_fn2(**kw):
+        draft_calls2.append(kw.get("text")); return None
+    edits2 = []
+    class B19b:
+        message_id = 78
+        async def edit_text(self, text, **kw): edits2.append(text)
+    ctx2 = mk_ctx()
+    ctx2.bot.send_message_draft = AsyncMock(side_effect=draft_fn2)
+    tb19b = B19b()
+    async def _send19b(**k): return tb19b
+    ctx2.bot.send_message = AsyncMock(side_effect=_send19b)
+    def gl19b(*a, **k):
+        yield {'type': 'msg_id', 'id': 'rd2'}
+        yield {'type': 'answer', 'text': 'classic answer text'}
+    md = MagicMock(); install_fakes(md)
+    md.create_chat.return_value = "sd2"; md.chat_stream = gl19b
+    os.environ.pop("NATIVE_STREAM", None)     # default → OFF
+    u = mk_update(text="classic test"); await on_text(u, ctx2)
+    ok("default: zero draft calls (no phantom '...' possible)",
+       not draft_calls2)
+    ok("default: live text streams in the answer bubble itself",
+       any("classic answer text" in e for e in edits2))
 
     # per-chat persistent draft id (stale draft from a dead request stays
     # reachable/clearable for the next request)

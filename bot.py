@@ -819,7 +819,22 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chats = await ds_op(q.from_user.id, 'list_chats') or []
         ctx.user_data['chat_list'] = chats
         if not chats:
-            await q.answer("No chats found", show_alert=True); return
+            # NOTE: a second q.answer(..., show_alert=True) here is silently
+            # ignored by Telegram (one answer per callback query) — that's why
+            # the empty state used to look like a dead button. Show it by
+            # editing the message instead; edits always work.
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🔙 Menu", callback_data="cmd:refresh")]])
+            try:
+                await q.edit_message_text(
+                    "📁 <b>No cloud chats found.</b>\n\n"
+                    "This account has no chats on DeepSeek right now — "
+                    "everything was wiped with 💥 Wipe All, or a 🆕 New chat "
+                    "hasn't started yet.\nJust type any message to begin!",
+                    parse_mode="HTML", reply_markup=kb)
+            except BadRequest:
+                pass
+            return
         text = f"<b>📁 Your DeepSeek Chats</b>\nTotal: {len(chats)} · Page {page+1}"
         try:
             await q.edit_message_text(text, parse_mode="HTML",
@@ -2350,7 +2365,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.5-wipe-all"
+        version = "v7.5.1-chats-empty-fix"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:

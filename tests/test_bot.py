@@ -211,6 +211,16 @@ async def run():
            and get_state(OWNER_ID).session_key is None)
         u, q = mk_query("chats:0"); c = mk_ctx(); await on_button(u, c)
         ok("chats list", c.user_data.get('chat_list'))
+        # v7.5.1: empty list must EDIT a "No cloud chats" panel — the old
+        # second q.answer(..., show_alert=True) was ignored by Telegram
+        # (one answer per callback query) → button looked dead.
+        _orig_list = md.list_chats.return_value
+        md.list_chats.return_value = []
+        u, q = mk_query("chats:0"); await on_button(u, mk_ctx())
+        ok("chats empty → panel edit", q.edit_message_text.called
+           and "No cloud chats" in (q.edit_message_text.call_args[0][0]
+                                    if q.edit_message_text.call_args else ""))
+        md.list_chats.return_value = _orig_list
         u, q = mk_query("switch:0"); c = mk_ctx()
         c.user_data['chat_list'] = md.list_chats.return_value
         await on_button(u, c)

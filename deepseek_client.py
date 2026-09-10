@@ -23,43 +23,43 @@ def _ds_proxies() -> Optional[dict]:
 
 def login_with_credentials_ex(email: str, password: str) -> Tuple[Optional[str], str]:
     """
-    Login to DeepSeek with email/password.
+    Login to DeepSeek with email/password (Android app contract).
     Returns (token, reason): token is None on failure and `reason` explains why:
       'ok'          — success
-      'bot_blocked' — DeepSeek's anti-bot challenge hit this server's IP
-                      (cloud/datacenter IPs get challenged; needs a proxy)
+      'bot_blocked' — anti-bot challenge (rare; needs a proxy)
       'api_changed' — DeepSeek changed the login contract
       'rate_limited'— too many login attempts
       anything else — upstream message (e.g. wrong password) or error tag
 
-    Uses the web client contract (os='web' + web headers). The old
-    Android-API trick (os='Android') is dead — DeepSeek now returns
-    HTTP 422 {"detail":[{"loc":"body.os"}]} for it.
+    REVERSE-ENGINEERED from DeepSeek APK v2.4.5 (266):
+      POST /api/v0/users/login
+      headers: x-client-platform=android, x-client-version=2.4.5,
+               x-client-bundle-id=com.deepseek.chat,
+               User-Agent=DeepSeek/2.4.5 Android/<sdk>
+      body:    {email, password, device_id: uuid4, os: "android"}
+    NOTE: os must be lowercase "android". The old "Android" (v5.2 era)
+    now fails HTTP 422 {"detail":[{"loc":"body.os"}]}, and the web
+    contract (os="web" + browser headers) gets WAF-challenged.
     """
     url = "https://chat.deepseek.com/api/v0/users/login"
-    web_headers = {
-        'accept': '*/*',
-        'accept-language': 'en-US,en;q=0.9',
+    app_headers = {
         'Content-Type': 'application/json',
-        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                       'AppleWebKit/537.36 (KHTML, like Gecko) '
-                       'Chrome/124.0 Safari/537.36'),
-        'Origin': 'https://chat.deepseek.com',
-        'Referer': 'https://chat.deepseek.com/sign_in',
-        'x-app-version': '20241129.1',
+        'User-Agent': 'DeepSeek/2.4.5 Android/34',
+        'Referer': 'https://chat.deepseek.com',
+        'x-client-platform': 'android',
+        'x-client-version': '2.4.5',
         'x-client-locale': 'en_US',
-        'x-client-platform': 'web',
-        'x-client-version': '1.0.0-always',
+        'x-client-bundle-id': 'com.deepseek.chat',
     }
     payload = {
         'email': email,
         'password': password,
         'device_id': str(uuid.uuid4()),
-        'os': 'web',
+        'os': 'android',
     }
     proxies = _ds_proxies()
     try:
-        resp = requests.post(url, headers=web_headers, json=payload,
+        resp = requests.post(url, headers=app_headers, json=payload,
                              timeout=20, proxies=proxies)
         if resp.status_code == 200:
             result = resp.json()

@@ -425,14 +425,29 @@ class DeepSeekClient:
     # ---------- Chat streaming ----------
     def chat_stream(self, sess_id: str, parent_msg_id: Optional[str], prompt: str,
                     model_type: str = 'default', thinking: bool = True, search: bool = False,
-                    file_ids: Optional[List[str]] = None) -> Iterator[Dict[str, Any]]:
+                    file_ids: Optional[List[str]] = None,
+                    preempt: bool = False) -> "ChatStream":
         """
         Yields events:
           {'type': 'think', 'text': str}    - thinking chunk
           {'type': 'answer', 'text': str}   - answer chunk
           {'type': 'msg_id', 'id': str}     - final assistant message id
           {'type': 'error', 'msg': str}
+
+        Returns a ChatStream — an iterator with .close() so the bot can abort
+        the HTTP stream exactly like the app's Stop button does.
+        `preempt=True` mirrors the app's "interrupt & send" (随停随发): the
+        server aborts the still-running message in this session and starts
+        this new completion instead.
         """
+        holder: Dict[str, Any] = {}
+        gen = self._chat_stream_iter(sess_id, parent_msg_id, prompt, model_type,
+                                     thinking, search, file_ids, preempt, holder)
+        return ChatStream(gen, holder)
+
+    def _chat_stream_iter(self, sess_id, parent_msg_id, prompt, model_type,
+                          thinking, search, file_ids, preempt, holder
+                          ) -> Iterator[Dict[str, Any]]:
         pow_resp = self._pow_header('/api/v0/chat/completion')
         if not pow_resp:
             yield {'type': 'error', 'msg': 'Failed to solve PoW challenge'}
@@ -454,14 +469,17 @@ class DeepSeekClient:
             'search_enabled': search,
             'model_type': model_type,
             # Fields the official app always sends (validated live, HTTP 200):
-            # preempt=false, action=None. Keeping them matches the current
-            # app contract (ChatFullCompletionRequest, APK v2.4.5).
-            'preempt': False,
+            # action=None. `preempt` comes from the app's ChatFullCompletion
+            # request — false normally, true when the user sends a new
+            # message while the same branch is still streaming (interrupt &
+            # send), which makes the server abort the WIP message.
+            'preempt': preempt,
             'action': None,
         }
 
         r = requests.post(f"{self.BASE}/chat/completion", headers=h, json=payload,
                           stream=True, timeout=300)
+        holder['resp'] = r   # exposed so ChatStream.close() can abort mid-read
         if r.status_code != 200:
             yield {'type': 'error', 'msg': f'HTTP {r.status_code}: {r.text[:200]}'}
             return
@@ -480,48 +498,97 @@ class DeepSeekClient:
 
         active_type = "RESPONSE"
 
-        for raw in r.iter_lines():
-            if not raw:
-                continue
-            line = raw.decode('utf-8', errors='ignore')
-            if not line.startswith('data:'):
-                continue
-            body = line[5:].strip()
-            if body == "[DONE]":
-                break
+        try:
+            for raw in r.iter_lines():
+                if not raw:
+                    continue
+                line = raw.decode('utf-8', errors='ignore')
+                if not line.startswith('data:'):
+                    continue
+                body = line[5:].strip()
+                if body == "[DONE]":
+                    break
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    continue
+
+                def _emit(txt):
+                    if not txt:
+                        return
+                    if active_type in ('FINISHED', 'END', 'DONE'):
+                        return
+                    yield {'type': 'think' if active_type == 'THINK' else 'answer', 'text': txt}
+
+                if isinstance(data, dict) and "v" in data and "p" not in data and "o" not in data:
+                    # Bare content chunk — could be dict with response or a plain string continuation
+                    v = data["v"]
+                    if isinstance(v, dict) and "response" in v:
+                        resp = v["response"]
+                        if "message_id" in resp:
+                            yield {'type': 'msg_id', 'id': resp["message_id"]}
+                        if resp.get("fragments"):
+                            frag = resp["fragments"][0]
+                            active_type = frag.get("type", "RESPONSE")
+                            yield from _emit(frag.get("content", ""))
+                    elif isinstance(v, str):
+                        yield from _emit(v)
+
+                elif isinstance(data, dict) and "p" in data and data.get("o") == "APPEND":
+                    path = data.get("p", "")
+                    val = data.get("v", "")
+                    if "fragments" in path and isinstance(val, list) and val:
+                        active_type = val[0].get("type", "RESPONSE")
+                        yield from _emit(val[0].get("content", ""))
+                    elif path == "response/fragments/-1/content":
+                        if isinstance(val, str):
+                            yield from _emit(val)
+                # SET / BATCH / other patch ops are ignored (metadata like status=FINISHED)
+        finally:
+            # Always release the SSE connection when the stream ends —
+            # normally, generator-closed, or aborted via ChatStream.close().
             try:
-                data = json.loads(body)
+                r.close()
             except Exception:
-                continue
+                pass
+            holder['resp'] = None
 
-            def _emit(txt):
-                if not txt:
-                    return
-                if active_type in ('FINISHED', 'END', 'DONE'):
-                    return
-                yield {'type': 'think' if active_type == 'THINK' else 'answer', 'text': txt}
 
-            if isinstance(data, dict) and "v" in data and "p" not in data and "o" not in data:
-                # Bare content chunk — could be dict with response or a plain string continuation
-                v = data["v"]
-                if isinstance(v, dict) and "response" in v:
-                    resp = v["response"]
-                    if "message_id" in resp:
-                        yield {'type': 'msg_id', 'id': resp["message_id"]}
-                    if resp.get("fragments"):
-                        frag = resp["fragments"][0]
-                        active_type = frag.get("type", "RESPONSE")
-                        yield from _emit(frag.get("content", ""))
-                elif isinstance(v, str):
-                    yield from _emit(v)
+class ChatStream:
+    """Closeable handle over one SSE completion stream.
 
-            elif isinstance(data, dict) and "p" in data and data.get("o") == "APPEND":
-                path = data.get("p", "")
-                val = data.get("v", "")
-                if "fragments" in path and isinstance(val, list) and val:
-                    active_type = val[0].get("type", "RESPONSE")
-                    yield from _emit(val[0].get("content", ""))
-                elif path == "response/fragments/-1/content":
-                    if isinstance(val, str):
-                        yield from _emit(val)
-            # SET / BATCH / other patch ops are ignored (metadata like status=FINISHED)
+    App-parity stop: the official app's Stop button has NO server endpoint —
+    it simply cancels the in-flight HTTP call, the server notices the
+    disconnect and finalizes the WIP message ("Stopped"), freeing the
+    session for the next prompt. close() does exactly that from our side;
+    without it the server keeps generating and the session rejects every
+    new message with "message still wip".
+    """
+
+    def __init__(self, gen: Iterator[Dict[str, Any]], holder: Dict[str, Any]):
+        self._gen = gen
+        self._holder = holder
+
+    def __iter__(self) -> "ChatStream":
+        return self
+
+    def __next__(self):
+        return next(self._gen)
+
+    def close(self):
+        """Abort the HTTP stream (idempotent).
+
+        Closing the response also unblocks a read that is currently waiting
+        for the next SSE chunk in another thread (the chunk will raise with
+        a closed-socket error, which ends the iteration)."""
+        try:
+            self._gen.close()
+        except Exception:
+            pass
+        r = self._holder.get('resp')
+        if r is not None:
+            self._holder['resp'] = None
+            try:
+                r.close()
+            except Exception:
+                pass

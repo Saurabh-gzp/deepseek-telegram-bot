@@ -32,7 +32,7 @@ import socket
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
                       BotCommand, BotCommandScopeChat, LinkPreviewOptions)
@@ -99,6 +99,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 LAST: Dict[int, dict] = {}
 # Cooperative cancellation: user ids that pressed /cancel or the Stop button
 CANCELLED: set = set()
+# Live SSE stream per user (uid -> deepseek_client.ChatStream). App-parity
+# stop: the official app has no stop endpoint — its Stop button simply
+# CANCELS the in-flight HTTP call, the server sees the disconnect and
+# finalizes the WIP message, freeing the session. Without closing the
+# stream, DeepSeek keeps generating and the session rejects every new
+# message with "message still wip".
+ACTIVE_STREAMS: Dict[int, Any] = {}
 # Sliding window of request timestamps per user, for rate limiting
 _RATE: Dict[int, List[float]] = {}
 MAX_HISTORY = 100
@@ -458,7 +465,8 @@ HELP_TEXT = (
 "📄 <b>File</b> — download as a .md file\n"
 "🔁 <b>Regen</b> — retry menu: fresh answer / ✂️ more concise / 📖 more details\n"
 "⚡ <b>Quick actions</b> — Translate/Summarize/Rephrase/Explain/Continue\n"
-"⏹ <b>Stop</b> — appears while generating (also /cancel)\n\n"
+"⏹ <b>Stop</b> — rok do turant; agli message phir bhi foran chalega (app "
+"jaisa — koi 'message still wip' error nahi). /cancel se bhi hota hai\n\n"
 "<b>App-parity features:</b>\n"
 "✏️ <b>Edit → Regen</b> — apna LAST message edit karo, jawab naye text "
 "se usi bubble me dobara banega (app jaisa)\n"
@@ -727,6 +735,12 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if user_lock(uid).locked():
         CANCELLED.add(uid)
+        # Same as the Stop button: abort the HTTP stream so the server
+        # finalizes the WIP message and the session is free again.
+        st = ACTIVE_STREAMS.get(uid)
+        if st is not None:
+            try: st.close()
+            except Exception: pass
         await update.message.reply_text("⏹ Stopping the current request…")
     else:
         await update.message.reply_text("Nothing is running right now.")
@@ -1077,6 +1091,15 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "rsp:stop":
         if user_lock(q.from_user.id).locked():
             CANCELLED.add(q.from_user.id)
+            # App-parity: cancel the in-flight HTTP call itself (the app's
+            # Stop button has no server endpoint — it aborts the stream and
+            # the server finalizes the WIP message). Without this, DeepSeek
+            # keeps generating server-side and the user's NEXT message dies
+            # with "DeepSeek: message still wip".
+            st = ACTIVE_STREAMS.get(q.from_user.id)
+            if st is not None:
+                try: st.close()
+                except Exception: pass
             await q.answer("Stopping…")
         else:
             await q.answer("Nothing is running")
@@ -2237,55 +2260,89 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                     await save_session(user_id)
                 except Exception:
                     pass
+            preempt_next = False
             for attempt in range(2):
-                gen = client.chat_stream(
+                stream = client.chat_stream(
                     s.session_id, s.parent_msg_id, final_prompt,
                     model_type=mode, thinking=thinking_on, search=search_on,
-                    file_ids=file_ids,
+                    file_ids=file_ids, preempt=preempt_next,
                 )
+                ACTIVE_STREAMS[user_id] = stream
                 stale_err = None
+                wip_err = None
                 yielded_any = False
-                while True:
-                    ev = await loop.run_in_executor(None, next, gen, None)
-                    if ev is None: break
-                    low = (ev.get('msg') or '').lower() if isinstance(ev, dict) else ''
-                    if (attempt == 0 and not yielded_any
-                            and isinstance(ev, dict) and ev.get('type') == 'error'
-                            and ('invalid chat session' in low
-                                 or ('session' in low
-                                     and ('invalid' in low or 'not found' in low)))):
-                        stale_err = ev
-                        break
-                    yielded_any = True
-                    yield ev
-                if stale_err is None:
+                try:
+                    while True:
+                        ev = await loop.run_in_executor(None, next, stream, None)
+                        if ev is None: break
+                        low = (ev.get('msg') or '').lower() if isinstance(ev, dict) else ''
+                        if (not yielded_any
+                                and isinstance(ev, dict) and ev.get('type') == 'error'
+                                and 'wip' in low):
+                            # Server: "message still wip" — the previous
+                            # generation in THIS session hasn't finalized yet
+                            # (stop pressed a second ago, an abandoned stream,
+                            # a pre-restart orphan). App-parity "interrupt &
+                            # send" (随停随发): retry with preempt=true — the
+                            # server aborts the old message and starts ours.
+                            wip_err = ev
+                            break
+                        if (attempt == 0 and not yielded_any
+                                and isinstance(ev, dict) and ev.get('type') == 'error'
+                                and ('invalid chat session' in low
+                                     or ('session' in low
+                                         and ('invalid' in low or 'not found' in low)))):
+                            stale_err = ev
+                            break
+                        yielded_any = True
+                        yield ev
+                finally:
+                    # Never leak the SSE connection: closed on normal end,
+                    # on error-break, and on generator close (stop path).
+                    if ACTIVE_STREAMS.get(user_id) is stream:
+                        ACTIVE_STREAMS.pop(user_id, None)
+                    try: stream.close()
+                    except Exception: pass
+                if stale_err is not None:
+                    # Heal on the SAME account as this lease (a fresh session from
+                    # a different key would be invalid again).
+                    log.info("Stale DeepSeek session %s — healing on key %s (user %s)",
+                             s.session_id[:8], lease.label, user_id)
+                    try:
+                        nsid = await loop.run_in_executor(None, client.create_chat)
+                    except Exception as e:
+                        log.warning("heal create_chat failed: %s", e)
+                        nsid = None
+                    if not nsid:
+                        yield stale_err
+                        return
+                    s.session_id = nsid
+                    s.parent_msg_id = None
+                    s.session_key = lease.label
+                    try:
+                        await save_session(user_id)
+                    except Exception:
+                        pass
+                    log.info("Stale DeepSeek session healed -> new session %s (user %s)",
+                             nsid[:8], user_id)
+                    yield {'type': 'info', 'msg': 'session_recovered'}
+                    continue
+                if wip_err is not None:
+                    if attempt == 0:
+                        log.info("Session %s busy ('message still wip') — "
+                                 "preempting old generation (user %s)",
+                                 s.session_id[:8], user_id)
+                        await asyncio.sleep(1.0)  # let the server finalize the old message
+                        preempt_next = True
+                        continue
+                    # Preempt also refused (very rare) — friendly message;
+                    # never leak the raw "message still wip" to the user.
+                    yield {'type': 'error', 'msg':
+                           'DeepSeek is still finishing the previous reply in '
+                           'this chat. Please send your message again in a few '
+                           'seconds (or use 🆕 New Chat).'}
                     return
-                # Heal on the SAME account as this lease (a fresh session from
-                # a different key would be invalid again).
-                log.info("Stale DeepSeek session %s — healing on key %s (user %s)",
-                         s.session_id[:8], lease.label, user_id)
-                try:
-                    nsid = await loop.run_in_executor(None, client.create_chat)
-                except Exception as e:
-                    log.warning("heal create_chat failed: %s", e)
-                    nsid = None
-                if not nsid:
-                    yield stale_err
-                    return
-                s.session_id = nsid
-                s.parent_msg_id = None
-                s.session_key = lease.label
-                try:
-                    await save_session(user_id)
-                except Exception:
-                    pass
-                try:
-                    gen.close()
-                except Exception:
-                    pass
-                log.info("Stale DeepSeek session healed -> new session %s (user %s)",
-                         nsid[:8], user_id)
-                yield {'type': 'info', 'msg': 'session_recovered'}
+                return
         return _gen()
 
     async def safe_edit(msg, text: str, kb=None) -> bool:
@@ -2668,7 +2725,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.7.3-edit-regen"
+        version = "v7.7.5-stop-fix"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:

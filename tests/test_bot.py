@@ -882,6 +882,151 @@ async def run():
     finally:
         _db_mod._db = orig_dbs20
 
+    print("\n===== 21. v7.7.5: app-parity stop (stream close + preempt) =====")
+
+    # --- 21a. ChatStream: closeable SSE handle (app-parity HTTP cancel) ---
+    import threading
+    import deepseek_client as _dsc
+    from deepseek_client import ChatStream, DeepSeekClient
+
+    class _Client21(DeepSeekClient):
+        def __init__(self):               # skip token/workdir wiring
+            self.headers = {'Content-Type': 'application/json'}
+        def _pow_header(self, target_path): return "pow"
+    cli21 = _Client21()
+    orig_post21 = _dsc.requests.post
+    captured = {}
+    class _FakeResp21:
+        status_code = 200
+        headers = {'content-type': 'text/event-stream'}
+        def __init__(self):
+            self._unblock = threading.Event()
+        def close(self): self._unblock.set()
+        def iter_lines(self):
+            yield b'data: {"v": {"response": {"message_id": "m1"}}}'
+            # simulates a read BLOCKED on the next SSE chunk (server still
+            # generating) — only a close() from another thread unblocks it
+            self._unblock.wait(3.0)
+            yield b'data: {"v": "chunk text"}'
+    resp21 = _FakeResp21()
+    def fake_post21(url, headers=None, json=None, stream=True, timeout=None):
+        captured['payload'] = json; return resp21
+    _dsc.requests.post = fake_post21
+    try:
+        st = cli21.chat_stream("sess21", None, "hello")
+        ev1 = next(st)
+        ok("chat_stream returns closeable ChatStream", isinstance(st, ChatStream))
+        ok("first SSE event parsed", ev1.get('type') == 'msg_id')
+        ok("default payload: preempt=false",
+           captured['payload'].get('preempt') is False)
+        st.close()   # ⏹ Stop pressed while the read is blocked
+        ok("stop → HTTP response closed (app-parity cancel)",
+           resp21._unblock.is_set())
+        next(st, None)   # iteration after close is safe (ends cleanly)
+        st.close()       # idempotent
+        st2 = cli21.chat_stream("sess21", None, "hello2", preempt=True)
+        next(st2)
+        ok("preempt=true payload jata hai (app: interrupt & send)",
+           captured['payload'].get('preempt') is True)
+        st2.close()
+        # normal end → response released, no connection leak
+        class _Resp21c:
+            status_code = 200
+            headers = {'content-type': 'text/event-stream'}
+            def __init__(self): self.closed = False
+            def close(self): self.closed = True
+            def iter_lines(self):
+                yield b'data: {"v": "done chunk"}'
+        resp21c = _Resp21c()
+        def fake_post21c(url, headers=None, json=None, stream=True, timeout=None):
+            return resp21c
+        _dsc.requests.post = fake_post21c
+        stc = cli21.chat_stream("s", None, "x")
+        evs = list(stc)
+        ok("normal stream end → response closed (koi leak nahi)",
+           resp21c.closed and any(e.get('text') == 'done chunk' for e in evs))
+    finally:
+        _dsc.requests.post = orig_post21
+
+    # --- 21b. ⏹ Stop button / /cancel → CANCELLED + live stream close ---
+    STATE.clear(); _bot.PENDING_INPUT.pop(OWNER_ID, None)
+    class _Stream21:
+        def __init__(self): self.closed = False
+        def close(self): self.closed = True
+    fs = _Stream21()
+    _bot.ACTIVE_STREAMS[OWNER_ID] = fs
+    lk21 = _bot.user_lock(OWNER_ID)
+    await lk21.acquire()
+    try:
+        u, q = mk_query("rsp:stop"); await on_button(u, mk_ctx())
+        ok("stop: CANCELLED flag lagta hai", OWNER_ID in _bot.CANCELLED)
+        ok("stop: live stream close hota hai (server WIP finalize)",
+           fs.closed)
+        ok("stop: 'Stopping…' answer", q.answer.called)
+    finally:
+        lk21.release(); _bot.CANCELLED.discard(OWNER_ID)
+        _bot.ACTIVE_STREAMS.pop(OWNER_ID, None)
+    fs2 = _Stream21()
+    _bot.ACTIVE_STREAMS[OWNER_ID] = fs2
+    await lk21.acquire()
+    try:
+        u = mk_update(); u.message.text = "/cancel"
+        await _bot.cancel_cmd(u, mk_ctx())
+        ok("/cancel: bhi stream close karta hai",
+           fs2.closed and OWNER_ID in _bot.CANCELLED)
+    finally:
+        lk21.release(); _bot.CANCELLED.discard(OWNER_ID)
+        _bot.ACTIVE_STREAMS.pop(OWNER_ID, None)
+
+    # --- 21c. 'message still wip' → automatic preempt retry (app parity) ---
+    STATE.clear()
+    edits21 = []
+    class B21:
+        message_id = 91
+        async def edit_text(self, text, **kw): edits21.append(text)
+    ctx21 = mk_ctx(); tb21 = B21()
+    ctx21.bot.send_message = AsyncMock(side_effect=lambda **k: tb21)
+    calls21 = []
+    def gl21(sess, parent, prompt, **kw):
+        calls21.append(kw.get('preempt'))
+        if len(calls21) == 1:
+            yield {'type': 'error', 'msg': 'DeepSeek: message still wip'}
+            return
+        yield {'type': 'msg_id', 'id': 'md1'}
+        yield {'type': 'answer', 'text': 'preempted answer'}
+    md = MagicMock(); install_fakes(md)
+    md.create_chat.return_value = "sd21"; md.chat_stream = gl21
+    u = mk_update(text="wip test"); await on_text(u, ctx21)
+    ok("wip error → auto preempt retry (normal + preempt dono bheje)",
+       calls21 == [False, True])
+    ok("preempt retry ka jawab user tak pahuncha",
+       any("preempted answer" in (e or "") for e in edits21))
+    ok("raw 'still wip' error user ko kabhi nahi dikha",
+       not any("still wip" in (e or "") for e in edits21))
+    ok("stream register cleanup ho gaya",
+       OWNER_ID not in _bot.ACTIVE_STREAMS)
+
+    # --- 21d. preempt bhi refuse → friendly error, raw wip leak nahi ---
+    STATE.clear()
+    edits21b = []
+    class B21b:
+        message_id = 92
+        async def edit_text(self, text, **kw): edits21b.append(text)
+    ctx21b = mk_ctx(); tb21b = B21b()
+    ctx21b.bot.send_message = AsyncMock(side_effect=lambda **k: tb21b)
+    calls21b = []
+    def gl21b(sess, parent, prompt, **kw):
+        calls21b.append(kw.get('preempt'))
+        yield {'type': 'error', 'msg': 'DeepSeek: message still wip'}
+    md = MagicMock(); install_fakes(md)
+    md.create_chat.return_value = "sd21b"; md.chat_stream = gl21b
+    u = mk_update(text="wip twice"); await on_text(u, ctx21b)
+    ok("dono attempts hue (normal phir preempt)", calls21b == [False, True])
+    ok("friendly fallback message gaya (raw wip error nahi)",
+       any("still finishing the previous reply" in (e or "") for e in edits21b)
+       and not any("DeepSeek: message still wip" in (e or "")
+                   for e in edits21b))
+
     print(f"\n{'='*50}\nRESULTS: {PASS} passed, {FAIL} failed\n{'='*50}")
     sys.exit(0 if FAIL == 0 else 1)
 

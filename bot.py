@@ -52,7 +52,7 @@ from urlfetch import (extract_urls, is_youtube, fetch_url_text,
 
 import admin as adm
 import db
-from scheduler import nightly_wipe_loop
+from scheduler import nightly_wipe_loop, nightly_enabled
 from token_pool import POOL
 
 # ---------- Config ----------
@@ -128,6 +128,9 @@ class UserState:
     # Telegram message id of the user's last normal prompt (memory-only).
     # Editing that message re-runs it — app-style "edit message → regen".
     last_prompt_msg_id: Optional[int] = None
+    # Telegram message id of the bot's last answer bubble (memory-only).
+    # Lets an edit→regen REPLACE the old answer in place, like the app.
+    last_answer_msg_id: Optional[int] = None
 
 # Write-through cache: uid -> UserState mirrored in MongoDB.
 STATE: Dict[int, UserState] = {}
@@ -1797,7 +1800,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if await handle_admin_input(update, ctx, pending):
             return
 
-    text = update.message.text
+    msg = update.message
+    # PTB delivers edited_message updates to handlers whose filters match
+    # update.effective_message — without the EDITED_MESSAGE exclusion in
+    # build_app() those updates landed HERE with update.message=None and
+    # crashed ('NoneType' object has no attribute 'text'). This guard is
+    # the belt-and-braces on top of the filter fix: edited messages belong
+    # to on_edited() only.
+    if msg is None or not msg.text:
+        return
+    text = msg.text
     s = get_state(uid)
 
     # URL detection
@@ -1810,7 +1822,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await _process_prompt_chat(
         ctx=ctx, chat_id=update.effective_chat.id, user_id=update.effective_user.id,
-        prompt=text, reply_to_msg_id=update.message.message_id,
+        prompt=text, reply_to_msg_id=msg.message_id,
     )
 
 
@@ -1819,6 +1831,11 @@ async def on_edited(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     App-parity: editing your LAST message re-runs it — DeepSeek generates a
     fresh answer for the edited text (app: edit message → new response).
     Only the most recent prompt is re-runnable, like the official app.
+
+    The new answer REPLACES the old answer bubble in place (same message id
+    via _RefMsg), and the stored history turn pair is amended so My Chats
+    mirrors the app: edited prompt + new answer, old content gone.
+    Non-text edits (captions) and edits of older messages are ignored.
     """
     msg = update.edited_message
     if not msg or not msg.text:
@@ -1833,7 +1850,7 @@ async def on_edited(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _process_prompt_chat(
         ctx=ctx, chat_id=update.effective_chat.id, user_id=uid,
         prompt=msg.text, reply_to_msg_id=msg.message_id,
-        is_regen=True)
+        is_regen=True, edit_regen=True)
 
 
 async def _try_url_summarize(ctx, update, url: str, original_text: str) -> bool:
@@ -1966,11 +1983,31 @@ async def _send_response_file(ctx, chat_id: int, prompt: str, answer: str):
 
 
 # ---------- Core streaming ----------
+class _RefMsg:
+    """Minimal stand-in for a PTB Message that can only be edited.
+
+    Lets an edit→regen stream INTO the previous answer bubble (same message
+    id) instead of posting a new reply bubble — the DeepSeek app replaces
+    the old answer in place when you edit your last message. Works with
+    Waiter/safe_edit because they only ever call edit_text().
+    """
+
+    def __init__(self, bot, chat_id: int, message_id: int):
+        self._bot = bot
+        self.chat_id = chat_id
+        self.message_id = message_id
+
+    async def edit_text(self, text: str, **kw):
+        return await self._bot.edit_message_text(
+            chat_id=self.chat_id, message_id=self.message_id, text=text, **kw)
+
+
 async def _process_prompt_chat(*, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                 user_id: int, prompt: str,
                                 reply_to_msg_id: Optional[int],
                                 is_regen: bool = False,
-                                is_quick_action: bool = False):
+                                is_quick_action: bool = False,
+                                edit_regen: bool = False):
     if not prompt or not prompt.strip():
         await ctx.bot.send_message(chat_id=chat_id, text="Empty prompt."); return
 
@@ -2001,14 +2038,15 @@ async def _process_prompt_chat(*, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
         await _process_prompt_chat_inner(
             ctx=ctx, chat_id=chat_id, user_id=user_id, prompt=prompt,
             reply_to_msg_id=reply_to_msg_id, is_regen=is_regen,
-            is_quick_action=is_quick_action)
+            is_quick_action=is_quick_action, edit_regen=edit_regen)
 
 
 async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                                       chat_id: int, user_id: int, prompt: str,
                                       reply_to_msg_id: Optional[int],
                                       is_regen: bool = False,
-                                      is_quick_action: bool = False):
+                                      is_quick_action: bool = False,
+                                      edit_regen: bool = False):
     s = get_state(user_id)
 
     # NOTE: no session creation here on purpose. A DeepSeek session only
@@ -2036,10 +2074,24 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
         await record_history(user_id, "user", prompt)
 
     await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
-    placeholder = await ctx.bot.send_message(
-        chat_id=chat_id, text="⏳ …",
-        reply_to_message_id=reply_to_msg_id,
-    )
+    placeholder = None
+    if edit_regen and s.last_answer_msg_id:
+        # App-parity: replace the OLD answer bubble in place instead of
+        # posting a new reply bubble — exactly what the DeepSeek app does
+        # when you edit your last message. Falls back to a fresh reply
+        # bubble if the old one is gone/uneditable (restart, deleted, …).
+        ref = _RefMsg(ctx.bot, chat_id, s.last_answer_msg_id)
+        try:
+            await ref.edit_text("⏳ …", parse_mode="HTML", reply_markup=stop_kb())
+            placeholder = ref
+        except Exception as e:
+            log.info("edit-regen: old answer bubble %s unusable (%s) — new reply bubble",
+                     s.last_answer_msg_id, e)
+    if placeholder is None:
+        placeholder = await ctx.bot.send_message(
+            chat_id=chat_id, text="⏳ …",
+            reply_to_message_id=reply_to_msg_id,
+        )
     # Determine initial waiter label — if queue, show "Analysing your request" as user requested
     initial_label = "Parsing files, DeepSeek is thinking" if file_ids else "DeepSeek is thinking"
     # If all slots busy, show queue message immediately (as per requirement: line-by-line queue)
@@ -2448,9 +2500,17 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
               'session_id': s.session_id, 'parent': s.parent_msg_id,
               'parent_before': parent_before,
           }
-          # Track bot response in history (skip regen since it replaces)
+          # Track bot response in history. Normal turns append; an
+          # edit→regen REPLACES the previous turn pair instead (app parity:
+          # edited prompt + fresh answer, old content swapped in place).
           if not is_regen and not is_quick_action:
               await record_history(user_id, "assistant", full_answer)
+          elif edit_regen:
+              try:
+                  await db.amend_last_turns(user_id, user_text=prompt,
+                                            assistant_text=full_answer)
+              except Exception as e:
+                  log.warning("amend_last_turns failed: %s", e)
 
           s.total_chars_out += len(full_answer)
           await save_session(user_id)
@@ -2474,6 +2534,7 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                   text=f"📄 Full response ({total_len:,} chars) attached above.",
                   reply_markup=response_footer_kb(has_text=True),
               )
+              s.last_answer_msg_id = messages[0].message_id   # preview bubble
           else:
               if not answer_started:
                   final = "⚠️ Model didn't produce an answer."
@@ -2495,6 +2556,9 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                                      kb=response_footer_kb(has_text=answer_started)):
                       break
                   await asyncio.sleep(2.5)
+              # Remember the answer bubble so an EDIT of the prompt can
+              # replace this answer in place (app-style edit→regen).
+              s.last_answer_msg_id = messages[-1].message_id
 
           # Auto-TTS if voice_reply is ON
           if s.voice_reply and answer_started and full_answer.strip():
@@ -2577,8 +2641,14 @@ async def _post_init(app):
         n_keys = await POOL.reload()
         log.info("DeepSeek key pool: %d key(s)", n_keys)
 
-        app.bot_data["wipe_task"] = asyncio.create_task(
-            nightly_wipe_loop(app.bot, OWNER_ID))
+        # Nightly cleanup is OFF by default (owner request: chats kabhi
+        # auto-delete na hon). Opt back in with NIGHTLY_CLEANUP=1 on Render.
+        if nightly_enabled():
+            app.bot_data["wipe_task"] = asyncio.create_task(
+                nightly_wipe_loop(app.bot, OWNER_ID))
+            log.info("Nightly cleanup loop started (NIGHTLY_CLEANUP=1)")
+        else:
+            log.info("Nightly cleanup OFF (default) — chats are never auto-deleted")
         app.bot_data["health_task"] = asyncio.create_task(
             health_check_loop(app.bot))
         log.info("Health check loop started (6h interval)")
@@ -2597,7 +2667,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.7.2-draft-off"
+        version = "v7.7.3-edit-regen"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:
@@ -2678,7 +2748,9 @@ def build_app():
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_media))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE,
+        on_text))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE
                                    & filters.ChatType.PRIVATE, on_edited))
     app.add_error_handler(on_error)

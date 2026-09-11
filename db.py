@@ -514,6 +514,32 @@ async def get_history(uid: int, limit: int = 100) -> List[Dict[str, Any]]:
     return list(reversed(rows))
 
 
+async def amend_last_turns(uid: int, *, user_text: Optional[str] = None,
+                           assistant_text: Optional[str] = None) -> None:
+    """App-parity edit→regen: rewrite the newest turns' TEXT in place.
+
+    DeepSeek app behaviour: editing your last message replaces that turn —
+    the old prompt text and the old answer are swapped for the edited/new
+    ones, and the conversation continues from there. Same here: the newest
+    user turn and the newest assistant turn keep their position and ts
+    (ordering intact), only the content changes. Missing rows → no-op.
+    """
+    if user_text is not None:
+        row = await _db.history.find_one({"uid": uid, "role": "user"},
+                                         sort=[("ts", DESCENDING)])
+        if row:
+            await _db.history.update_one(
+                {"_id": row["_id"]},
+                {"$set": {"text": user_text[:20000]}})
+    if assistant_text is not None:
+        row = await _db.history.find_one({"uid": uid, "role": "assistant"},
+                                         sort=[("ts", DESCENDING)])
+        if row:
+            await _db.history.update_one(
+                {"_id": row["_id"]},
+                {"$set": {"text": assistant_text[:20000]}})
+
+
 async def clear_history(uid: int) -> int:
     r = await _db.history.delete_many({"uid": uid})
     return r.deleted_count

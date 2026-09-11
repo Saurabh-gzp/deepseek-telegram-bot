@@ -1,7 +1,11 @@
 """
 scheduler.py — nightly maintenance.
 
-Midnight cleanup is now PROTECTED-AWARE (v7.7.1):
+DEFAULT OFF (v7.7.3): the nightly cleanup no longer runs at all unless the
+owner explicitly opts in with NIGHTLY_CLEANUP=1. User request — chats are
+NEVER auto-deleted: no midnight wipe, no session resets, no report message.
+
+Even when opted in, the pass is PROTECTED-AWARE (v7.7.1):
   • Admins (role=admin) and daily-active users (seen in the last 24h) are
     NEVER touched — their stored chats and DeepSeek session pointers survive.
   • Inactive users' turns expire via the 24h TTL. Turns written while a user
@@ -13,11 +17,17 @@ Midnight cleanup is now PROTECTED-AWARE (v7.7.1):
 """
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 
 import db
 
 log = logging.getLogger("scheduler")
+
+
+def nightly_enabled() -> bool:
+    """Nightly cleanup runs ONLY when NIGHTLY_CLEANUP=1 is explicitly set."""
+    return os.getenv("NIGHTLY_CLEANUP", "0") == "1"
 
 
 def _seconds_until_midnight(tz=None) -> float:

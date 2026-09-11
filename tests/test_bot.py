@@ -737,6 +737,150 @@ async def run():
        "safe" in sent.get("t", "").lower()
        and "protected" in sent.get("t", "").lower())
 
+    print("\n===== 20. v7.7.3: edited-message crash fix + app-parity edit→regen =====")
+
+    # --- on_text must NEVER process edited_message updates (old bug: PTB's
+    # filters.TEXT also matches edits via effective_message → on_text ran
+    # with update.message=None → 'NoneType' object has no attribute 'text',
+    # aur on_edited kabhi chala hi nahi) ---
+    STATE.clear()
+    called.clear()
+    with patch.object(_bot, "_process_prompt_chat", side_effect=fake_proc):
+        u = mk_update(text="x")
+        u.message = None
+        u.edited_message = MagicMock()
+        u.edited_message.text = "edited text"
+        crashed = False
+        try:
+            await on_text(u, mk_ctx())
+        except AttributeError:
+            crashed = True
+    ok("on_text: edited update → no crash, no processing",
+       not crashed and not called)
+
+    # --- nightly cleanup ab DEFAULT OFF (user ne mana kiya tha) ---
+    from scheduler import nightly_enabled
+    _old_nc = os.environ.pop("NIGHTLY_CLEANUP", None)
+    try:
+        ok("nightly cleanup: default OFF (koi auto-delete nahi)",
+           nightly_enabled() is False)
+        os.environ["NIGHTLY_CLEANUP"] = "0"
+        ok("nightly cleanup: =0 → OFF", nightly_enabled() is False)
+        os.environ["NIGHTLY_CLEANUP"] = "1"
+        ok("nightly cleanup: sirf explicit opt-in par ON",
+           nightly_enabled() is True)
+    finally:
+        os.environ.pop("NIGHTLY_CLEANUP", None)
+        if _old_nc is not None:
+            os.environ["NIGHTLY_CLEANUP"] = _old_nc
+
+    # --- edit→regen: answer bubble IN-PLACE replace hota hai (app parity) ---
+    STATE.clear()
+    s = get_state(OWNER_ID)
+    s.last_prompt_msg_id = 555
+    s.last_answer_msg_id = 999
+    edit_calls = []
+    sent_new = []
+    async def fake_edit20(**kw):
+        edit_calls.append(kw); return True
+    def gl20(*a, **k):
+        yield {'type': 'msg_id', 'id': 'rd20'}
+        yield {'type': 'answer', 'text': 'edited fresh answer'}
+    md = MagicMock(); install_fakes(md)
+    md.create_chat.return_value = "s20"; md.chat_stream = gl20
+    ctx20 = mk_ctx()
+    ctx20.bot.edit_message_text = AsyncMock(side_effect=fake_edit20)
+    async def _send20(**k):
+        sent_new.append(k); return make_bubble()
+    ctx20.bot.send_message = AsyncMock(side_effect=_send20)
+    amended = {}
+    async def fake_amend(uid, **kw):
+        amended.update(kw); amended["uid"] = uid
+    _o_amend = _db_mod.amend_last_turns
+    _db_mod.amend_last_turns = fake_amend
+    u = mk_update(text="edited prompt v2")
+    u.edited_message = u.message
+    u.edited_message.message_id = 555
+    try:
+        await _bot.on_edited(u, ctx20)
+    finally:
+        _db_mod.amend_last_turns = _o_amend
+    ok("edit→regen: purana answer bubble in-place replace",
+       any(c.get("message_id") == 999
+           and "edited fresh answer" in str(c.get("text", ""))
+           for c in edit_calls))
+    ok("edit→regen: koi naya reply bubble nahi bana", not sent_new)
+    ok("edit→regen: history amend (edited prompt + fresh answer)",
+       amended.get("user_text") == "edited prompt v2"
+       and amended.get("assistant_text") == "edited fresh answer"
+       and amended.get("uid") == OWNER_ID)
+    ok("edit→regen: answer bubble id yaad rakhi",
+       get_state(OWNER_ID).last_answer_msg_id == 999)
+
+    # --- fallback: purana bubble gayab ho to naya reply bubble, no crash ---
+    STATE.clear()
+    s = get_state(OWNER_ID)
+    s.last_prompt_msg_id = 556
+    s.last_answer_msg_id = 888
+    async def boom_edit20(**kw):
+        raise BadRequest("message to edit not found")
+    sent_fb = []
+    ctx_fb = mk_ctx()
+    ctx_fb.bot.edit_message_text = AsyncMock(side_effect=boom_edit20)
+    async def _sendfb(**k):
+        sent_fb.append(k); return make_bubble()
+    ctx_fb.bot.send_message = AsyncMock(side_effect=_sendfb)
+    def gl_fb(*a, **k):
+        yield {'type': 'msg_id', 'id': 'rdfb'}
+        yield {'type': 'answer', 'text': 'fallback answer'}
+    md = MagicMock(); install_fakes(md)
+    md.create_chat.return_value = "sfb"; md.chat_stream = gl_fb
+    _db_mod.amend_last_turns = fake_amend
+    u = mk_update(text="edited prompt v3")
+    u.edited_message = u.message
+    u.edited_message.message_id = 556
+    crashed = False
+    try:
+        await _bot.on_edited(u, ctx_fb)
+    except Exception:
+        crashed = True
+    finally:
+        _db_mod.amend_last_turns = _o_amend
+    ok("edit→regen: dead bubble par fallback reply bubble",
+       not crashed and any(k.get("reply_to_message_id") == 556 for k in sent_fb))
+
+    # --- db.amend_last_turns: sirf TEXT badalta hai, ts/role/position safe ---
+    class _H20:
+        def __init__(self, rows): self.rows = list(rows); self.updates = []
+        async def find_one(self, q, sort=None):
+            rows = [r for r in self.rows
+                    if r["role"] == q["role"] and r["uid"] == q["uid"]]
+            return rows[-1] if rows else None
+        async def update_one(self, q, sup):
+            self.updates.append(q["_id"])
+            for r in self.rows:
+                if r["_id"] == q["_id"]:
+                    r["text"] = sup["$set"]["text"]
+    h20 = _H20([
+        {"_id": "a", "uid": 7, "role": "user", "text": "old q", "ts": 1},
+        {"_id": "b", "uid": 7, "role": "assistant", "text": "old a", "ts": 2},
+    ])
+    orig_dbs20 = _db_mod._db
+    _db_mod._db = type("DB", (), {"history": h20})()
+    try:
+        await _db_mod.amend_last_turns(7, user_text="new q",
+                                       assistant_text="new a")
+        by = {r["_id"]: r for r in h20.rows}
+        ok("amend: user+assistant text swap in place",
+           by["a"]["text"] == "new q" and by["b"]["text"] == "new a")
+        ok("amend: ts/role/position untouched",
+           by["a"]["ts"] == 1 and by["a"]["role"] == "user"
+           and by["b"]["ts"] == 2 and by["b"]["role"] == "assistant")
+        await _db_mod.amend_last_turns(99, user_text="no rows for this uid")
+        ok("amend: missing rows → no-op", len(h20.updates) == 2)
+    finally:
+        _db_mod._db = orig_dbs20
+
     print(f"\n{'='*50}\nRESULTS: {PASS} passed, {FAIL} failed\n{'='*50}")
     sys.exit(0 if FAIL == 0 else 1)
 

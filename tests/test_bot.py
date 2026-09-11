@@ -527,14 +527,31 @@ async def run():
     u = mk_update(text="edit of an older message")
     u.edited_message = u.message
     u.edited_message.message_id = 42
-    await _bot.on_edited(u, mk_ctx())
-    ok("edit of older message ignored", not called)
+    with patch.object(_bot, "_process_prompt_chat", side_effect=fake_proc):
+        await _bot.on_edited(u, mk_ctx())
+    ok("older message edit → fresh answer as reply (koi edit ignore nahi)",
+       called.get('prompt') == "edit of an older message"
+       and called.get('reply_to_msg_id') == 42
+       and 'is_regen' not in called and 'edit_regen' not in called)
     called.clear()
-    u = mk_update(text="no prompt sent yet")
+    s.last_prompt_msg_id = 42   # real flow: normal prompt path isko set karta hai
+    u = mk_update(text="second edit of same message")
+    u.edited_message = u.message
+    u.edited_message.message_id = 42
+    with patch.object(_bot, "_process_prompt_chat", side_effect=fake_proc):
+        await _bot.on_edited(u, mk_ctx())
+    ok("ab wahi message dobara edit → in-place regen",
+       called.get('prompt') == "second edit of same message"
+       and called.get('is_regen') is True and called.get('edit_regen') is True)
+    called.clear()
+    u = mk_update(text="unknown message edit")
     u.edited_message = u.message
     u.edited_message.message_id = 777
-    await _bot.on_edited(u, mk_ctx())
-    ok("edit without known last prompt ignored", not called)
+    with patch.object(_bot, "_process_prompt_chat", side_effect=fake_proc):
+        await _bot.on_edited(u, mk_ctx())
+    ok("unknown message edit bhi jawab deta hai",
+       called.get('prompt') == "unknown message edit"
+       and 'is_regen' not in called)
 
     # normal prompts record their message id for future edits
     STATE.clear()

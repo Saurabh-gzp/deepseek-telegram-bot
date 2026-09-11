@@ -460,8 +460,9 @@ HELP_TEXT = (
 "⚡ <b>Quick actions</b> — Translate/Summarize/Rephrase/Explain/Continue\n"
 "⏹ <b>Stop</b> — appears while generating (also /cancel)\n\n"
 "<b>App-parity features:</b>\n"
-"✏️ <b>Edit → Regen</b> — apna LAST message edit karo, jawab naye text "
-"se dobara banega (app jaisa)\n"
+"✏️ <b>Edit → Regen</b> — koi bhi apna message edit karo: LAST message "
+"edit karne par naya jawab purane bubble ki jagah aayega (app jaisa); "
+"purane message ke edit ka jawab usi message pe reply me milega\n"
 "🔄 <b>Account</b> — Menu button se doosre pool account pe switch karo "
 "(naya chat usi account pe banega)\n"
 "🧠 <b>Thinking</b> — jawab ke upar collapsed block, tap karke expand\n\n"
@@ -1828,14 +1829,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_edited(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    App-parity: editing your LAST message re-runs it — DeepSeek generates a
-    fresh answer for the edited text (app: edit message → new response).
-    Only the most recent prompt is re-runnable, like the official app.
+    App-parity: editing a message re-runs it — DeepSeek generates a fresh
+    answer for the edited text (app: edit message → new response).
 
-    The new answer REPLACES the old answer bubble in place (same message id
-    via _RefMsg), and the stored history turn pair is amended so My Chats
-    mirrors the app: edited prompt + new answer, old content gone.
-    Non-text edits (captions) and edits of older messages are ignored.
+    • LAST prompt edited → the old answer bubble is REPLACED in place
+      (_RefMsg) and the stored history turn pair is amended — exactly like
+      the official app's edit flow.
+    • ANY older message edited → the edited text is answered as a fresh
+      prompt (reply bubble, recorded in history like a normal turn). Koi
+      text-edit ignore nahi hota — sab messages ke edits ka jawab milta hai.
+    • Non-text edits (captions) are ignored.
     """
     msg = update.edited_message
     if not msg or not msg.text:
@@ -1844,13 +1847,18 @@ async def on_edited(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     s = get_state(uid)
-    if not s.last_prompt_msg_id or msg.message_id != s.last_prompt_msg_id:
-        return  # not the last prompt — silently ignore (no spam)
-    log.info("Edit→regen: user %s edited prompt %s", uid, msg.message_id)
+    if s.last_prompt_msg_id and msg.message_id == s.last_prompt_msg_id:
+        log.info("Edit→regen: user %s edited last prompt %s", uid, msg.message_id)
+        await _process_prompt_chat(
+            ctx=ctx, chat_id=update.effective_chat.id, user_id=uid,
+            prompt=msg.text, reply_to_msg_id=msg.message_id,
+            is_regen=True, edit_regen=True)
+        return
+    # Older/unknown message edit → edited text ka jawab naye prompt ki tarah
+    log.info("Edit→answer: user %s edited older msg %s", uid, msg.message_id)
     await _process_prompt_chat(
         ctx=ctx, chat_id=update.effective_chat.id, user_id=uid,
-        prompt=msg.text, reply_to_msg_id=msg.message_id,
-        is_regen=True, edit_regen=True)
+        prompt=msg.text, reply_to_msg_id=msg.message_id)
 
 
 async def _try_url_summarize(ctx, update, url: str, original_text: str) -> bool:

@@ -43,6 +43,7 @@ from telegram.ext import (
 )
 
 from deepseek_client import DeepSeekClient, RULES, login_with_credentials, login_with_credentials_ex
+import otp_auth
 from md2tg import (md_to_tg_html, strip_incomplete_markers, safe_for_telegram,
                    split_message)
 from personas import PERSONAS, get_persona, wrap_prompt
@@ -772,6 +773,14 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_admin(q, ctx, data)
         return
 
+    # --- OTP verification (DeepSeek v2.6.x risk-device flow, admin only) ---
+    if data.startswith("otp:"):
+        if not is_admin(q.from_user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        await handle_otp_callback(q, ctx, data)
+        return
+
     # --- mode/toggles ---
     # Legacy mode: buttons (Instant/Expert/Vision) removed in the new DeepSeek
     # app. If an old keyboard is still on screen, just refresh the menu.
@@ -1490,12 +1499,200 @@ async def handle_admin(q, ctx, data: str):
             "<i>/cancel to abort.</i>")
         return
 
+async def handle_otp_callback(q, ctx, data: str):
+    """Drive the DeepSeek OTP verification flow (risk-device recovery).
+
+    Pending state lives in PENDING_INPUT[uid] with kind "otp_pending" and
+    carries label/email/password/device_id from the failed add-account attempt.
+    """
+    uid = q.from_user.id
+    pend = PENDING_INPUT.get(uid) or {}
+    if pend.get("kind") not in ("otp_pending", "otp_email_sent", "otp_sms_sent"):
+        await q.answer("Pehle account add karo — OTP session expire ho gaya.", show_alert=True)
+        return
+    which = data.split(":", 1)[1] if ":" in data else ""
+    email = pend.get("email", "")
+    device_id = pend.get("device_id", "")
+    workdir = os.getcwd()
+
+    if which == "email":
+        await q.message.reply_html("⏳ <b>Email OTP bhej raha hu...</b>")
+        try:
+            ok, reason = await asyncio.to_thread(
+                otp_auth.request_email_otp, email, device_id, "register")
+        except Exception as e:
+            await q.message.reply_html(f"❌ OTP request exception: <code>{html.escape(str(e)[:150])}</code>")
+            return
+        if not ok:
+            if reason == "captcha_required":
+                await q.message.reply_html(
+                    "🛡 <b>DeepSeek ne captcha manga</b> (Turnstile).\n"
+                    "Bot server se captcha solve nahi kar sakta.\n\n"
+                    "Options:\n"
+                    "1. 📱 <b>SMS OTP</b> try karo (neeche wala flow, captcha-free hai)\n"
+                    "2. Apne phone/browser me ek baar login karke device verify karo, "
+                    "phir yahan dobara try karo\n"
+                    "3. ➕ <b>Add Token (manual)</b> se seedha token paste karo")
+                return
+            if reason.startswith("too_frequent"):
+                await q.message.reply_html(
+                    f"⏳ <b>OTP abhi-abhi bheja gaya tha.</b> {reason.split(':')[1]}s ruk ke dobara try karo.")
+                return
+            await q.message.reply_html(f"❌ Email OTP nahi bheja ja saka: <code>{html.escape(reason[:150])}</code>")
+            return
+        pend["kind"] = "otp_email_sent"
+        PENDING_INPUT[uid] = pend
+        await q.message.reply_html(
+            f"📩 <b>OTP bhej diya!</b> <code>{html.escape(email)}</code> pe code aaya hoga.\n\n"
+            "Woh <b>6-digit code</b> yahan message me bhejo.\n"
+            "<i>/cancel — abort karne ke liye</i>")
+
+    elif which == "sms":
+        pend["kind"] = "otp_sms_mobile"
+        PENDING_INPUT[uid] = pend
+        await q.message.reply_html(
+            "📱 <b>SMS OTP login</b>\n\n"
+            "Account se <b>linked mobile number</b> bhejo (sirf digits):\n"
+            "Example: <code>9876543210</code>\n"
+            "Agar country India nahi hai to area code bhi likho: <code>1 2025551234</code>\n\n"
+            "<i>/cancel — abort karne ke liye</i>")
+    else:
+        await q.answer("Unknown OTP option.", show_alert=True)
+
+
+async def _finish_otp_account(uid, message, pend: dict, token: str):
+    """Save a freshly OTP-verified account into the pool."""
+    label = pend.get("label", "")
+    email = pend.get("email", "")
+    password = pend.get("password", "")
+    device_id = pend.get("device_id", "")
+    # label might collide if admin retried — make unique
+    base, n = label, 1
+    while await db.get_token_doc(label):
+        n += 1
+        label = f"{base}-{n}"
+    ok = await db.add_email_account(label, email, password, token, device_id=device_id)
+    PENDING_INPUT.pop(uid, None)
+    if not ok:
+        await message.reply_html("❌ DB error — account save nahi hua.")
+        return
+    n = await POOL.reload()
+    await message.reply_html(
+        f"✅ <b>Account OTP se verify ho ke add ho gaya!</b> <code>{html.escape(label)}</code>\n"
+        f"📧 {html.escape(email)}\n"
+        f"🔑 Token: <code>{html.escape(token[:12])}…</code>\n\n"
+        f"Pool ab <b>{n}</b> account(s). 🟢 Auto-refresh enabled.")
+    try:
+        await message.reply_html(await adm.accounts_text(),
+                                 reply_markup=adm.accounts_kb(await db.list_tokens()))
+    except Exception:
+        pass
+
+
 async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
     """Consume a typed admin input (key / broadcast / DM). Returns True if used."""
     uid = update.effective_user.id
     text_raw = (update.message.text or "").strip()
     kind = pending.get("kind")
     PENDING_INPUT.pop(uid, None)
+
+    # --- OTP verification inputs (DeepSeek v2.6.x risk-device flow) ---
+    if kind == "otp_email_sent":
+        code = "".join(ch for ch in text_raw if ch.isdigit())
+        if len(code) < 4:
+            PENDING_INPUT[uid] = pending  # keep waiting
+            await update.message.reply_html("❌ Code kam se kam 4 digits ka hona chahiye. Dobara bhejo.")
+            return True
+        await update.message.reply_html("⏳ <b>OTP verify kar raha hu...</b>")
+        try:
+            ok, reason = await asyncio.to_thread(
+                otp_auth.verify_email_otp, pending.get("email", ""), code)
+        except Exception as e:
+            PENDING_INPUT[uid] = pending
+            await update.message.reply_html(f"❌ Verify exception: <code>{html.escape(str(e)[:150])}</code>")
+            return True
+        if not ok:
+            PENDING_INPUT[uid] = pending  # keep waiting for retry
+            await update.message.reply_html(
+                f"❌ <b>OTP galat/expire ho gaya:</b> <code>{html.escape(reason[:120])}</code>\n"
+                "Sahi code dobara bhejo, ya /cancel karke abort karo.")
+            return True
+        # Email verified — retry the password login (risk flag should be cleared)
+        await update.message.reply_html("✅ <b>Email verified!</b> Ab login retry kar raha hu...")
+        try:
+            token, reason = await asyncio.to_thread(
+                login_with_credentials_ex, pending.get("email", ""),
+                pending.get("password", ""), pending.get("device_id", ""))
+        except Exception as e:
+            await update.message.reply_html(f"❌ Login exception: <code>{html.escape(str(e)[:150])}</code>")
+            return True
+        if not token:
+            await update.message.reply_html(
+                f"❌ <b>Login phir bhi fail:</b> <code>{html.escape(str(reason)[:150])}</code>\n"
+                "➕ <b>Add Token (manual)</b> use karo, ya 📱 SMS OTP try karo.")
+            return True
+        await _finish_otp_account(uid, update.message, pending, token)
+        return True
+
+    if kind == "otp_sms_mobile":
+        parts = text_raw.split()
+        if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) <= 4:
+            area_code, mobile = parts[0], "".join(ch for ch in parts[1] if ch.isdigit())
+        else:
+            mobile = "".join(ch for ch in text_raw if ch.isdigit())
+            area_code = "91" if len(mobile) == 10 else "86"
+        if len(mobile) < 7:
+            PENDING_INPUT[uid] = pending
+            await update.message.reply_html("❌ Sahi mobile number bhejo (sirf digits).")
+            return True
+        await update.message.reply_html(f"⏳ <b>SMS OTP bhej raha hu</b> (+{area_code} {mobile})...")
+        try:
+            ok, reason = await asyncio.to_thread(
+                otp_auth.request_sms_otp, mobile, area_code,
+                pending.get("device_id", ""), os.getcwd())
+        except Exception as e:
+            PENDING_INPUT[uid] = pending
+            await update.message.reply_html(f"❌ SMS exception: <code>{html.escape(str(e)[:150])}</code>")
+            return True
+        if not ok:
+            if reason.startswith("too_frequent"):
+                await update.message.reply_html(
+                    f"⏳ <b>Abhi-abhi OTP bheja gaya tha.</b> {reason.split(':')[1]}s ruk ke dobara try karo.")
+            else:
+                await update.message.reply_html(f"❌ SMS OTP nahi bheja ja saka: <code>{html.escape(reason[:150])}</code>")
+            return True
+        pending["kind"] = "otp_sms_code"
+        pending["mobile"] = mobile
+        pending["area_code"] = area_code
+        PENDING_INPUT[uid] = pending
+        await update.message.reply_html(
+            f"📱 <b>SMS bhej diya!</b> +{area_code} {mobile} pe code aaya hoga.\n\n"
+            "Woh code yahan message me bhejo.\n<i>/cancel — abort karne ke liye</i>")
+        return True
+
+    if kind == "otp_sms_code":
+        code = "".join(ch for ch in text_raw if ch.isdigit())
+        if len(code) < 4:
+            PENDING_INPUT[uid] = pending
+            await update.message.reply_html("❌ Code kam se kam 4 digits ka hona chahiye. Dobara bhejo.")
+            return True
+        await update.message.reply_html("⏳ <b>SMS OTP se login kar raha hu...</b>")
+        try:
+            token, reason = await asyncio.to_thread(
+                otp_auth.login_with_sms_otp, pending.get("mobile", ""),
+                pending.get("area_code", "86"), code, pending.get("device_id", ""))
+        except Exception as e:
+            PENDING_INPUT[uid] = pending
+            await update.message.reply_html(f"❌ Login exception: <code>{html.escape(str(e)[:150])}</code>")
+            return True
+        if not token:
+            PENDING_INPUT[uid] = pending
+            await update.message.reply_html(
+                f"❌ <b>Login fail:</b> <code>{html.escape(str(reason)[:150])}</code>\n"
+                "Sahi code dobara bhejo, ya /cancel karke abort karo.")
+            return True
+        await _finish_otp_account(uid, update.message, pending, token)
+        return True
 
     if kind == "add_email_account":
         label, email, password = _parse_email_account_input(text_raw)
@@ -1512,10 +1709,34 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
             await update.message.reply_html(f"❌ Label <b>{label}</b> already exists. Try different label.")
             return True
         await update.message.reply_html(f"⏳ <b>Logging in {email}...</b>\n<i>DeepSeek se token fetch kar raha hu, thoda wait...</i>")
+        import uuid as _uuid
+        _device_id = str(_uuid.uuid4())
         try:
-            token, reason = await asyncio.to_thread(login_with_credentials_ex, email, password)
+            token, reason = await asyncio.to_thread(
+                login_with_credentials_ex, email, password, _device_id)
         except Exception as e:
             await update.message.reply_html(f"❌ Login exception: <code>{html.escape(str(e)[:200])}</code>")
+            return True
+        if not token and reason == "risk_device":
+            # NEW (DeepSeek v2.6.x): server flagged this IP/device — password
+            # login alone won't work, OTP verification is required.
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📩 Email OTP bhejo", callback_data="otp:email")],
+                [InlineKeyboardButton("📱 SMS OTP se login", callback_data="otp:sms")],
+            ])
+            PENDING_INPUT[uid] = {"kind": "otp_pending", "label": label,
+                                  "email": email, "password": password,
+                                  "device_id": _device_id}
+            await update.message.reply_html(
+                f"🛡 <b>DeepSeek ne is login ko risky flag kiya</b>\n"
+                f"Email: <code>{html.escape(email)}</code>\n\n"
+                "Naye DeepSeek update me is IP/device se seedha password login "
+                "block hai — <b>OTP verification</b> chahiye.\n\n"
+                "📩 <b>Email OTP:</b> tumhare email pe code aayega (note: DeepSeek "
+                "kabhi-kabhi captcha mangta hai, tab SMS wala use karo)\n"
+                "📱 <b>SMS OTP:</b> account se linked mobile number pe code aayega\n\n"
+                "<i>Neeche button dabao, phir aaya hua OTP code yahan bhejo.</i>",
+                reply_markup=kb)
             return True
         if not token:
             if reason == "bot_blocked":
@@ -1551,7 +1772,8 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
                     parse_mode="HTML")
             except Exception: pass
             return True
-        ok = await db.add_email_account(label, email, password, token)
+        ok = await db.add_email_account(label, email, password, token,
+                                        device_id=_device_id)
         if not ok:
             await update.message.reply_html(f"❌ DB error — label <b>{html.escape(label)}</b> already exists.")
             return True

@@ -128,13 +128,22 @@ class TokenPool:
         auth_type = doc.get("auth_type", "token")
         if auth_type != "email" or not email or not password:
             return False, "No email/password stored — add email/pass to enable auto-refresh"
-        # Try login
+        # Try login (stable device_id per account — see db.get_account_device_id)
         try:
+            device_id = await db.get_account_device_id(label)
             new_token, reason = await asyncio.to_thread(
-                login_with_credentials_ex, email, password)
+                login_with_credentials_ex, email, password, device_id)
         except Exception as e:
             return False, f"Login exception: {e}"
         if not new_token:
+            if reason == "risk_device":
+                # New DeepSeek risk engine: password login from this IP/device
+                # is flagged. Don't nuke the account — it needs OTP verification.
+                await db.mark_token(label, healthy=True,
+                                    error="NEEDS_OTP: DeepSeek flagged this login "
+                                          "(RISK_DEVICE_DETECTED). Verify via OTP.")
+                return False, ("needs_otp: DeepSeek ne is device/IP ko risky flag kiya. "
+                               "Admin panel se OTP verification karo (📩/📱 OTP bhejo).")
             await db.mark_token(label, healthy=False,
                                 error=f"Login failed ({reason})")
             if reason == "bot_blocked":

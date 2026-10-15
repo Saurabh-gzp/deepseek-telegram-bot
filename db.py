@@ -421,8 +421,15 @@ async def add_token(token: str, label: str) -> bool:
         return False
 
 
-async def add_email_account(label: str, email: str, password: str, token: str) -> bool:
-    """Add account with email/password + token. Duplicate label -> False."""
+async def add_email_account(label: str, email: str, password: str, token: str,
+                          device_id: str = "") -> bool:
+    """Add account with email/password + token. Duplicate label -> False.
+
+    device_id: stable per-account device id reused on every login/refresh.
+    A fresh random id per login looks like a new device and trips DeepSeek's
+    risk engine (RISK_DEVICE_DETECTED). Generated automatically when empty.
+    """
+    import uuid as _uuid
     try:
         await _db.tokens.insert_one({
             "token": token,
@@ -434,12 +441,29 @@ async def add_email_account(label: str, email: str, password: str, token: str) -
             "auth_type": "email",
             "email": email,
             "password": password,
+            "device_id": device_id or str(_uuid.uuid4()),
             "last_login": _now(),
             "last_check": _now(),
         })
         return True
     except DuplicateKeyError:
         return False
+
+
+async def get_account_device_id(label: str) -> str:
+    """Return the stored device_id for an account, creating one if missing."""
+    import uuid as _uuid
+    doc = await get_token_doc(label)
+    if not doc:
+        return str(_uuid.uuid4())
+    did = doc.get("device_id") or ""
+    if not did:
+        did = str(_uuid.uuid4())
+        try:
+            await _db.tokens.update_one({"label": label}, {"$set": {"device_id": did}})
+        except Exception:
+            pass
+    return did
 
 
 async def update_account_token(label: str, new_token: str) -> bool:

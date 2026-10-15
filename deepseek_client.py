@@ -21,40 +21,47 @@ def _ds_proxies() -> Optional[dict]:
     return {"http": p, "https": p} if p else None
 
 
-def login_with_credentials_ex(email: str, password: str) -> Tuple[Optional[str], str]:
+def login_with_credentials_ex(email: str, password: str,
+                                device_id: Optional[str] = None
+                                ) -> Tuple[Optional[str], str]:
     """
     Login to DeepSeek with email/password (Android app contract).
     Returns (token, reason): token is None on failure and `reason` explains why:
       'ok'          — success
+      'risk_device' — DeepSeek flagged this IP/device (biz 11 RISK_DEVICE_DETECTED);
+                      use the OTP flow in otp_auth.py to verify account ownership
+      'mfa_required'— account has MFA on; login returned an mfa_ticket instead
+      'wrong_password' — biz 2 PASSWORD_OR_USER_NAME_IS_WRONG
       'bot_blocked' — anti-bot challenge (rare; needs a proxy)
       'api_changed' — DeepSeek changed the login contract
       'rate_limited'— too many login attempts
-      anything else — upstream message (e.g. wrong password) or error tag
+      anything else — upstream message or error tag
 
-    REVERSE-ENGINEERED from DeepSeek APK v2.4.5 (266):
+    REVERSE-ENGINEERED from DeepSeek APK v2.6.2 (282), 2026-10-15:
       POST /api/v0/users/login
-      headers: x-client-platform=android, x-client-version=2.4.5,
+      headers: x-client-platform=android, x-client-version=2.6.2,
                x-client-bundle-id=com.deepseek.chat,
-               User-Agent=DeepSeek/2.4.5 Android/<sdk>
-      body:    {email, password, device_id: uuid4, os: "android"}
-    NOTE: os must be lowercase "android". The old "Android" (v5.2 era)
-    now fails HTTP 422 {"detail":[{"loc":"body.os"}]}, and the web
-    contract (os="web" + browser headers) gets WAF-challenged.
+               User-Agent=DeepSeek/2.6.2 Android/34
+      body:    {email, password, device_id, os: "android"}
+    NOTE (v2.6.x change): biz_data.user is now a PLAIN STRING (the session
+    token), not {"token": ...} anymore. Both shapes are accepted here.
+    Pass a STABLE device_id per account (stored in DB) — a fresh random id on
+    every login looks like a new device and trips the risk engine.
     """
     url = "https://chat.deepseek.com/api/v0/users/login"
     app_headers = {
         'Content-Type': 'application/json',
-        'User-Agent': 'DeepSeek/2.4.5 Android/34',
+        'User-Agent': 'DeepSeek/2.6.2 Android/34',
         'Referer': 'https://chat.deepseek.com',
         'x-client-platform': 'android',
-        'x-client-version': '2.4.5',
+        'x-client-version': '2.6.2',
         'x-client-locale': 'en_US',
         'x-client-bundle-id': 'com.deepseek.chat',
     }
     payload = {
         'email': email,
         'password': password,
-        'device_id': str(uuid.uuid4()),
+        'device_id': device_id or str(uuid.uuid4()),
         'os': 'android',
     }
     proxies = _ds_proxies()
@@ -64,11 +71,23 @@ def login_with_credentials_ex(email: str, password: str) -> Tuple[Optional[str],
         if resp.status_code == 200:
             result = resp.json()
             if result.get('code') == 0 and 'data' in result:
-                token = (result.get('data', {}).get('biz_data', {})
-                         .get('user', {}).get('token'))
+                data = result.get('data') or {}
+                biz_code = data.get('biz_code', -1)
+                biz_msg = data.get('biz_msg') or ''
+                biz_data = data.get('biz_data') or {}
+                # MFA gate: server returns mfa_ticket instead of a session
+                if biz_data.get('mfa_ticket'):
+                    return None, 'mfa_required'
+                user = biz_data.get('user')
+                # v2.6.x: user is the token string; older: {"token": ...}
+                token = user if isinstance(user, str) else (user or {}).get('token')
                 if token:
                     return token, 'ok'
-                return None, 'token_missing'
+                if biz_code == 11 or biz_msg == 'RISK_DEVICE_DETECTED':
+                    return None, 'risk_device'
+                if biz_code == 2 or biz_msg == 'PASSWORD_OR_USER_NAME_IS_WRONG':
+                    return None, 'wrong_password'
+                return None, (biz_msg or f'biz_code={biz_code}')
             return None, (result.get('msg') or 'DeepSeek rejected the login')
         body_head = (resp.text or '')[:200].lower()
         if resp.status_code == 202 or not body_head or '<html' in body_head:
@@ -82,9 +101,10 @@ def login_with_credentials_ex(email: str, password: str) -> Tuple[Optional[str],
         return None, f'network: {type(e).__name__}'
 
 
-def login_with_credentials(email: str, password: str) -> Optional[str]:
+def login_with_credentials(email: str, password: str,
+                           device_id: Optional[str] = None) -> Optional[str]:
     """Backward-compatible wrapper. Returns token or None (use _ex for reason)."""
-    token, _ = login_with_credentials_ex(email, password)
+    token, _ = login_with_credentials_ex(email, password, device_id=device_id)
     return token
 
 

@@ -116,10 +116,92 @@ def solve_guest_pow(target_path: str, workdir: str = ".",
     return out or None
 
 
+# ---------------------------------------------------------------- hCaptcha
+# DeepSeek shows an hCaptcha image challenge ("Verify account" screen) before
+# sending the email OTP on risky logins. The app solves it in-app; server-side
+# we use a solving service (CapSolver / 2captcha style).
+#
+# REQUIRED (Render env vars):
+#   HCAPTCHA_SITEKEY  — DeepSeek's hCaptcha sitekey. Not bundled in the APK;
+#                       grab it once via HTTP Canary when the challenge appears
+#                       (widget loads js.hcaptcha.com with
+#                       host=<sitekey>.android-sdk.hcaptcha.com).
+#   CAPSOLVER_KEY     — API key from capsolver.com (pay-per-solve, ~$1-3/1000).
+#
+# Flow: solve_hcaptcha() -> token -> request_email_otp(..., hcaptcha_token=token)
+
+CAPSOLVER_API = "https://api.capsolver.com"
+
+
+def solve_hcaptcha(sitekey: Optional[str] = None,
+                   api_key: Optional[str] = None,
+                   page_url: str = "https://chat.deepseek.com",
+                   timeout: int = 120) -> Tuple[Optional[str], str]:
+    """
+    Solve DeepSeek's hCaptcha via CapSolver. Returns (token, reason).
+    """
+    import time as _time
+    sitekey = sitekey or os.getenv("HCAPTCHA_SITEKEY", "")
+    api_key = api_key or os.getenv("CAPSOLVER_KEY", "")
+    if not sitekey:
+        return None, "no_sitekey"
+    if not api_key:
+        return None, "no_capsolver_key"
+    try:
+        r = requests.post(f"{CAPSOLVER_API}/createTask", json={
+            "clientKey": api_key,
+            "task": {
+                "type": "HCaptchaTask",
+                "websiteURL": page_url,
+                "websiteKey": sitekey,
+                "isInvisible": False,
+            },
+        }, timeout=20)
+        task_id = (r.json() or {}).get("taskId")
+    except Exception as e:
+        return None, f"network: {type(e).__name__}"
+    if not task_id:
+        return None, "task_create_failed"
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        _time.sleep(5)
+        try:
+            r = requests.post(f"{CAPSOLVER_API}/getTaskResult", json={
+                "clientKey": api_key, "taskId": task_id,
+            }, timeout=20)
+            j = r.json() or {}
+        except Exception:
+            continue
+        if j.get("status") == "ready":
+            token = (j.get("solution") or {}).get("gRecaptchaResponse")
+            return (token, "ok") if token else (None, "no_token")
+        if j.get("status") == "failed":
+            return None, str(j.get("errorDescription") or j.get("errorCode") or "failed")
+    return None, "timeout"
+
+
+def request_email_otp_with_captcha(email: str, device_id: Optional[str] = None,
+                                   scenario: str = "register",
+                                   workdir: str = ".") -> Tuple[bool, str]:
+    """
+    Full email-OTP send: solve hCaptcha via CapSolver, then request the code.
+    Returns (ok, reason). Reasons: 'ok', 'no_sitekey', 'no_capsolver_key',
+    'captcha_failed:<reason>', 'too_frequent:<secs>', ...
+    """
+    token, reason = solve_hcaptcha()
+    if not token:
+        if reason in ("no_sitekey", "no_capsolver_key"):
+            return False, reason
+        return False, f"captcha_failed:{reason}"
+    return request_email_otp(email, device_id=device_id, scenario=scenario,
+                             turnstile_token="", hcaptcha_token=token)
+
+
 # ---------------------------------------------------------------- Email OTP
 def request_email_otp(email: str, device_id: Optional[str] = None,
                       scenario: str = "register",
-                      turnstile_token: str = "") -> Tuple[bool, str]:
+                      turnstile_token: str = "",
+                      hcaptcha_token: str = "") -> Tuple[bool, str]:
     """
     Send an email verification code. Returns (ok, message/reason).
     Reasons: 'ok', 'captcha_required', 'too_frequent', 'api_changed', ...
@@ -132,6 +214,8 @@ def request_email_otp(email: str, device_id: Optional[str] = None,
         "device_id": device_id,
         "scenario": scenario,
     }
+    if hcaptcha_token:
+        payload["hcaptcha_token"] = hcaptcha_token
     try:
         r = requests.post(f"{BASE}/users/create_email_verification_code",
                           headers=app_headers(), json=payload,

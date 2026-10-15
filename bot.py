@@ -1516,14 +1516,34 @@ async def handle_otp_callback(q, ctx, data: str):
     workdir = os.getcwd()
 
     if which == "email":
-        await q.message.reply_html("⏳ <b>Email OTP bhej raha hu...</b>")
+        await q.message.reply_html("⏳ <b>Email OTP bhej raha hu...</b>\n<i>Pehle hCaptcha solve ho raha hai, phir OTP jayega...</i>")
         try:
             ok, reason = await asyncio.to_thread(
-                otp_auth.request_email_otp, email, device_id, "register")
+                otp_auth.request_email_otp_with_captcha, email, device_id, "register")
         except Exception as e:
             await q.message.reply_html(f"❌ OTP request exception: <code>{html.escape(str(e)[:150])}</code>")
             return
         if not ok:
+            if reason in ("no_sitekey", "no_capsolver_key"):
+                await q.message.reply_html(
+                    "⚠️ <b>Email OTP ke liye setup adhura hai.</b>\n\n"
+                    "DeepSeek email OTP se pehle hCaptcha mangta hai (wahi jo tumhare "
+                    "screenshot me dikha). Bot usko auto-solve kar sakta hai, lekin do "
+                    "cheezein chahiye:\n\n"
+                    "1. <b>HCAPTCHA_SITEKEY</b> — HTTP Canary se ek baar nikalo: jab app "
+                    "me captcha aaye to <code>js.hcaptcha.com</code> wali request me "
+                    "<code>&lt;sitekey&gt;.android-sdk.hcaptcha.com</code> dikhega\n"
+                    "2. <b>CAPSOLVER_KEY</b> — capsolver.com se API key (pay-per-solve, "
+                    "~$1-3 per 1000)\n\n"
+                    "Dono ko Render → Environment me add karo.\n\n"
+                    "📱 <b>Abhi ke liye SMS OTP wala button dabao</b> — wo bina kisi "
+                    "setup ke seedha kaam karta hai.")
+                return
+            if reason.startswith("captcha_failed"):
+                await q.message.reply_html(
+                    f"❌ <b>hCaptcha solve nahi hua:</b> <code>{html.escape(reason[:150])}</code>\n"
+                    "Thodi der ruk ke dobara try karo, ya 📱 SMS OTP use karo.")
+                return
             if reason == "captcha_required":
                 await q.message.reply_html(
                     "⚠️ <b>Email OTP nahi bheja ja saka.</b>\n"

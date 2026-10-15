@@ -1526,13 +1526,12 @@ async def handle_otp_callback(q, ctx, data: str):
         if not ok:
             if reason == "captcha_required":
                 await q.message.reply_html(
-                    "🛡 <b>DeepSeek ne captcha manga</b> (Turnstile).\n"
-                    "Bot server se captcha solve nahi kar sakta.\n\n"
-                    "Options:\n"
-                    "1. 📱 <b>SMS OTP</b> try karo (neeche wala flow, captcha-free hai)\n"
-                    "2. Apne phone/browser me ek baar login karke device verify karo, "
-                    "phir yahan dobara try karo\n"
-                    "3. ➕ <b>Add Token (manual)</b> se seedha token paste karo")
+                    "⚠️ <b>Email OTP nahi bheja ja saka.</b>\n"
+                    "DeepSeek ne is request pe apna invisible risk-check manga "
+                    "(app me ye Shumei SDK background me handle karta hai, "
+                    "isliye tumhe kabhi dikhta nahi).\n\n"
+                    "📱 <b>SMS OTP wala button dabao</b> — wo captcha-free hai "
+                    "aur server se seedha kaam karta hai.")
                 return
             if reason.startswith("too_frequent"):
                 await q.message.reply_html(
@@ -1720,9 +1719,12 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
         if not token and reason == "risk_device":
             # NEW (DeepSeek v2.6.x): server flagged this IP/device — password
             # login alone won't work, OTP verification is required.
+            # NOTE: SMS OTP is the reliable server-side path (no captcha on
+            # that endpoint). Email OTP needs the app's invisible Shumei risk
+            # proof which can't be generated server-side.
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📩 Email OTP bhejo", callback_data="otp:email")],
-                [InlineKeyboardButton("📱 SMS OTP se login", callback_data="otp:sms")],
+                [InlineKeyboardButton("📱 SMS OTP se login (recommended)", callback_data="otp:sms")],
+                [InlineKeyboardButton("📩 Email OTP try karo", callback_data="otp:email")],
             ])
             PENDING_INPUT[uid] = {"kind": "otp_pending", "label": label,
                                   "email": email, "password": password,
@@ -1732,9 +1734,10 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
                 f"Email: <code>{html.escape(email)}</code>\n\n"
                 "Naye DeepSeek update me is IP/device se seedha password login "
                 "block hai — <b>OTP verification</b> chahiye.\n\n"
-                "📩 <b>Email OTP:</b> tumhare email pe code aayega (note: DeepSeek "
-                "kabhi-kabhi captcha mangta hai, tab SMS wala use karo)\n"
-                "📱 <b>SMS OTP:</b> account se linked mobile number pe code aayega\n\n"
+                "📱 <b>SMS OTP (recommended):</b> account se linked mobile number "
+                "pe code aayega — captcha-free hai\n"
+                "📩 <b>Email OTP:</b> try kar sakte ho, lekin DeepSeek kabhi-kabhi "
+                "app ka invisible risk-check mangta hai jo server se nahi hota\n\n"
                 "<i>Neeche button dabao, phir aaya hua OTP code yahan bhejo.</i>",
                 reply_markup=kb)
             return True

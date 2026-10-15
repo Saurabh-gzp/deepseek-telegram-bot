@@ -8,11 +8,14 @@ Reverse-engineered from DeepSeek Android APK v2.6.2 (com.deepseek.chat):
       {email, locale, shumei_verification?, hcaptcha_token?, turnstile_token,
        device_id, scenario}
       scenario is a STRING: "register" | "reset_password" (NOT "login")
-      NOTE: DeepSeek's server currently enforces a Cloudflare Turnstile token
-      for this endpoint (empty token -> RECAPTCHA_VERIFY_FAILED). The bot
-      cannot mint Turnstile tokens server-side, so request_email_otp() accepts
-      an optional turnstile_token (e.g. solved by the admin in a browser) and
-      reports 'captcha_required' otherwise.
+      NOTE: DeepSeek's server wants an anti-bot proof with this call. The
+      official app supplies it INVISIBLY via the on-device Shumei risk SDK
+      (com.ishumei.sdk) — that's why no captcha is ever visible in the app.
+      Server-side we cannot mint a Shumei rid or a Turnstile token, so
+      request_email_otp() usually gets RECAPTCHA_VERIFY_FAILED from flagged
+      IPs. It accepts an optional turnstile_token (solve it elsewhere and
+      pass it in). From a clean residential IP (DS_PROXY) it may pass
+      without one.
     POST /api/v0/users/check_email_code
       {email, email_verification_code} -> {biz_code 0} on success
 

@@ -77,14 +77,31 @@ Both are free and take 30 seconds to set up.
 
 ---
 
-## 🔑 Getting your DeepSeek token
+## 🔑 Getting your DeepSeek token (RK Gamers flow)
+
+This build runs in **single-account mode** — one DeepSeek account, managed entirely from Telegram.
+
+### The easy way (RK Gamers folder)
+
+1. Open the **DeepSeek RK** app on your phone (RK GAMERS build) and log in once
+2. In any file manager open **Internal Storage → RK Gamers** folder:
+   `RK Gamers/deepseek/com.deepseek.chat.rk/RK-TOKEN.txt`
+3. Copy the long string after `TOKEN:` — the app keeps this file always fresh
+4. In the bot send: `/settoken <paste the token>` — it validates live and goes live instantly
+5. Full guide anytime: `/token` command or /admin → 🔑 My DeepSeek Account
+
+### Token lifecycle (auto-refresh)
+
+- **API stops working** → bot tries auto-refresh via stored email+password
+- **Email+password set?** (/admin → 📧 Auto-Refresh ON) → renewals are 100% automatic, you are never asked for tokens
+- **No email/pass stored?** → the bot messages you with the exact RK-TOKEN.txt steps; paste a fresh token with `/settoken` and you're back in seconds
+- Setting a new token ALWAYS replaces the old account (single-account mode)
+
+### Browser fallback
 
 1. Open [chat.deepseek.com](https://chat.deepseek.com) and log in
-2. Open browser DevTools (F12) → **Application** tab → **Local Storage** → `https://chat.deepseek.com`
-3. Find the `userToken` key — copy its value
-4. Paste as `DEEPSEEK_TOKEN` in Render
-
-This token expires after ~30 days. Refresh it whenever the bot starts saying "session expired".
+2. DevTools (F12) → Console → `localStorage.getItem("userToken")`
+3. Copy the value → `/settoken <value>`
 
 ---
 

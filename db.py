@@ -421,6 +421,41 @@ async def add_token(token: str, label: str) -> bool:
         return False
 
 
+async def replace_single_account(*, token: str, label: str = "rk-gamers",
+                                 email: str = "", password: str = "",
+                                 device_id: str = "",
+                                 auth_type: str = "token") -> bool:
+    """SINGLE-ACCOUNT MODE (RK Gamers build).
+
+    The bot serves exactly ONE DeepSeek account. Setting a new account always
+    REPLACES whatever is in the tokens collection — no multi-key pool, no
+    duplicate labels, no leftovers from older deploys.
+    """
+    import uuid as _uuid
+    try:
+        await _db.tokens.delete_many({})
+        await _db.tokens.insert_one({
+            "token": token,
+            "label": label or "rk-gamers",
+            "added_at": _now(),
+            "healthy": True,
+            "uses": 0,
+            "last_error": "",
+            "auth_type": auth_type,
+            "email": email,
+            "password": password,
+            "device_id": device_id or str(_uuid.uuid4()),
+            "last_login": _now() if auth_type == "email" else 0,
+            "last_check": 0,
+        })
+        log.info("Single-account mode: pool replaced with '%s' (%s)",
+                 label, auth_type)
+        return True
+    except PyMongoError as e:
+        log.error("replace_single_account failed: %s", e)
+        return False
+
+
 async def add_email_account(label: str, email: str, password: str, token: str,
                           device_id: str = "") -> bool:
     """Add account with email/password + token. Duplicate label -> False.

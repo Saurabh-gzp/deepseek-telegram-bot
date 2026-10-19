@@ -133,6 +133,57 @@ def validate_token(token: str, workdir: str = ".") -> bool:
     except Exception:
         return False
 
+
+def get_user_info(token: str, workdir: str = ".") -> Optional[Dict[str, Any]]:
+    """
+    GET /users/current — validates the token AND returns the account details
+    (user id, email, phone…). Returns the user dict, or None when the token
+    is rejected / network fails.
+
+    Used by the bot right after /settoken so the owner SEES whose account is
+    now wired in ("Token set · account: r***@gmail.com").
+    """
+    try:
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'X-Client-Platform': 'web',
+            'X-Client-Version': '2.0.2',
+            'Origin': 'https://chat.deepseek.com',
+            'Referer': 'https://chat.deepseek.com/'
+        }
+        r = requests.get("https://chat.deepseek.com/api/v0/users/current",
+                         headers=headers, timeout=15)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        if j.get('code') != 0:
+            return None
+        data = (j.get('data') or {})
+        user = (data.get('biz_data') or {}).get('user')
+        if isinstance(user, dict) and user:
+            return user
+        # Defensive: DeepSeek occasionally moves the payload — scan for a
+        # dict that carries an email/user id instead of failing outright.
+        def _scan(obj):
+            if isinstance(obj, dict):
+                if ('email' in obj) or ('id' in obj and len(obj) >= 2):
+                    return obj
+                for v in obj.values():
+                    found = _scan(v)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for it in obj:
+                    found = _scan(it)
+                    if found:
+                        return found
+            return None
+        return _scan(data)
+    except Exception:
+        return None
+
 WASM_FILENAME = "sha3_wasm_bg.7b9ca65ddd.wasm"
 JS_SOLVER_FILENAME = "pow_solver.js"
 WASM_URL = "https://raw.githubusercontent.com/xtekky/deepseek4free/main/dsk/wasm/sha3_wasm_bg.7b9ca65ddd.wasm"

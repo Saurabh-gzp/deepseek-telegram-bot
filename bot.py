@@ -42,7 +42,9 @@ from telegram.ext import (
     ContextTypes, filters,
 )
 
-from deepseek_client import DeepSeekClient, RULES, login_with_credentials, login_with_credentials_ex
+from deepseek_client import (DeepSeekClient, RULES, login_with_credentials,
+                             login_with_credentials_ex, validate_token,
+                             get_user_info)
 import otp_auth
 from md2tg import (md_to_tg_html, strip_incomplete_markers, safe_for_telegram,
                    split_message)
@@ -114,6 +116,31 @@ MAX_HISTORY = 100
 PENDING_INPUT: Dict[int, dict] = {}
 # Users we already pinged the owner about (avoid repeat spam)
 PENDING_NOTIFIED: Dict[int, bool] = {}
+
+# --------------------------------------------------------------------------
+# SINGLE-ACCOUNT MODE (RK Gamers build)
+# --------------------------------------------------------------------------
+# The bot serves exactly ONE DeepSeek account (no multi-account pool). The
+# token comes from the phone's "RK Gamers" mirror folder (written by the
+# DeepSeek RK app as RK-TOKEN.txt) and is pasted in via /settoken.
+#
+# When the API stops working the bot tries, in order:
+#   1. auto-refresh via stored email+password (if the owner added them),
+#   2. asking the OWNER for a fresh token from RK-TOKEN.txt.
+RK_TOKEN_FILE_HINT = "RK Gamers/deepseek/com.deepseek.chat.rk/RK-TOKEN.txt"
+TOKEN_REQUEST_TEXT = (
+    "⚠️ <b>DeepSeek token kaam nahi kar raha!</b>\n\n"
+    "🔹 Reason: <i>{reason}</i>\n\n"
+    "🔑 <b>Naya token aise do (2 minute):</b>\n"
+    "1. Phone me <b>DeepSeek RK</b> app kholo (ek baar chat kholo/app relaunch karo)\n"
+    "2. File manager → Internal Storage → <b>RK Gamers</b> folder\n"
+    f"3. <code>{RK_TOKEN_FILE_HINT}</code> kholo\n"
+    "4. <b>TOKEN:</b> wali lambi string copy karo (file hamesha fresh rehti hai)\n"
+    "5. Yahan bhejo: <code>/settoken &lt;token&gt;</code>\n\n"
+    "💡 <i>Permanent fix:</i> /admin → My DeepSeek Account → 📧 <b>Auto-Refresh ON "
+    "karo (email+pass)</b> — phir bot expire pe khud refresh karega, aapse kabhi "
+    "token nahi maangega."
+)
 
 
 # ---------- State ----------
@@ -348,7 +375,7 @@ def main_menu_kb(s: UserState, uid: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🎭 Persona: {get_persona(s.persona)['name']}",
                               callback_data="personas:0")],
         [InlineKeyboardButton("🆕 New Chat", callback_data="cmd:new"),
-         InlineKeyboardButton("🔄 Account", callback_data="acct:switch")],
+         InlineKeyboardButton("🔑 Account", callback_data="acct:switch")],
         [InlineKeyboardButton("📁 My Chats", callback_data="chats:0"),
          InlineKeyboardButton("📤 Export", callback_data="cmd:export")],
         [InlineKeyboardButton("📊 Stats", callback_data="cmd:stats"),
@@ -471,8 +498,8 @@ HELP_TEXT = (
 "<b>App-parity features:</b>\n"
 "✏️ <b>Edit → Regen</b> — apna LAST message edit karo, jawab naye text "
 "se usi bubble me dobara banega (app jaisa)\n"
-"🔄 <b>Account</b> — Menu button se doosre pool account pe switch karo "
-"(naya chat usi account pe banega)\n"
+"🔄 <b>Account</b> — single-account mode: sab queries isi account se jaati hain "
+"(Menu → Account se status dekho)\n"
 "🧠 <b>Thinking</b> — jawab ke upar collapsed block, tap karke expand\n\n"
 "<b>Toggles:</b>\n"
 "🧠 Think — reasoning chain\n"
@@ -491,7 +518,9 @@ HELP_TEXT = (
 "Your chats are private — no other user can see them.\n"
 "All conversations are deleted automatically every night.\n\n"
 "<b>Slash commands:</b>\n"
-"/start — menu\n/help — this page\n/cancel — stop the running task\n\n"
+"/start — menu\n/help — this page\n/cancel — stop the running task\n"
+"🔑 /settoken &lt;token&gt; — RK-TOKEN.txt se DeepSeek token set karo (owner)\n"
+"📖 /token — token guide + account status (owner)\n\n"
 "<i>💡 Tip: just type normally — input type is detected automatically.</i>"
 )
 
@@ -753,6 +782,111 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(HELP_TEXT, reply_markup=kb)
 
 
+# --------------------------------------------------------------------------
+# SINGLE-ACCOUNT token management (RK Gamers build) — /settoken + /token
+# --------------------------------------------------------------------------
+
+def _clean_token(raw: str) -> str:
+    """Accept messy pastes: 'label = token', quotes, newlines, /settoken X."""
+    tok = (raw or "").strip()
+    # strip a leading /settoken if the user pasted the whole command back
+    if tok.lower().startswith("/settoken"):
+        tok = tok[len("/settoken"):].strip()
+    if "=" in tok:
+        left, right = tok.split("=", 1)
+        # "label = token" form only when the left side looks like a label
+        if len(left.strip()) <= 24 and " " not in left.strip():
+            tok = right.strip()
+    tok = tok.strip().strip('"').strip("'").strip("`").strip()
+    # if a whole RK-TOKEN.txt was pasted, grab the value after "TOKEN:"
+    m = re.search(r'TOKEN\s*[:=]\s*([A-Za-z0-9_\-\.+/=]{32,})', tok)
+    if m:
+        tok = m.group(1)
+    # multiline paste → prefer the longest token-like chunk (DeepSeek session
+    # tokens are ~64 chars of base64-ish text); fallback to the first chunk.
+    parts = tok.split()
+    if parts:
+        cands = [p for p in parts
+                 if len(p) >= 32 and re.fullmatch(r'[A-Za-z0-9_\-\.+/=]+', p)]
+        tok = max(cands, key=len) if cands else parts[0]
+    return tok.strip()
+
+
+async def _apply_new_token(msg, raw: str) -> None:
+    """Validate + store a fresh single account, then confirm to the sender."""
+    token = _clean_token(raw)
+    if len(token) < 32:
+        await msg.reply_html(
+            "❌ <b>Ye token lagta hai adhoora hai.</b>\n\n"
+            "RK-TOKEN.txt me <code>TOKEN:</code> ke baad wali <b>poori lambi "
+            "string</b> copy karo (60+ characters) aur dubara bhejo:\n"
+            "<code>/settoken &lt;token&gt;</code>\n\n"
+            "📖 <i>Steps nahi yaad? /token command guide dikhata hai.</i>")
+        return
+    wait = await msg.reply_html("⏳ <b>Token verify kar raha hu…</b> "
+                                "(DeepSeek se live check ho raha hai)")
+    ok = await asyncio.to_thread(validate_token, token, WORKDIR)
+    if not ok:
+        await wait.edit_text(
+            "❌ <b>Token verify NAHI hua</b> — expire ho chuka hai ya galat hai.\n\n"
+            "🔑 RK-TOKEN.txt se <b>fresh</b> token copy karo (app ko ek baar "
+            "kholke file refresh karo) aur dobara bhejo:\n"
+            "<code>/settoken &lt;token&gt;</code>",
+            parse_mode="HTML")
+        return
+    info = await asyncio.to_thread(get_user_info, token, WORKDIR) or {}
+    email = info.get("email") or ""
+    uid_ds = info.get("id") or ""
+    ok2 = await db.replace_single_account(token=token, label="rk-gamers",
+                                          email=email)
+    n = await POOL.reload()
+    if not ok2:
+        await wait.edit_text("❌ <b>DB error</b> — token save nahi hua. "
+                             "Thodi der baad try karo.", parse_mode="HTML")
+        return
+    acct = f"<code>{html.escape(str(email))}</code>" if email else \
+        f"<code>{html.escape(str(uid_ds))}</code>"
+    await wait.edit_text(
+        "✅ <b>Token SET + VERIFIED — bot LIVE hai! 🚀</b>\n\n"
+        f"• Account: {acct}\n"
+        f"• Token: <code>{html.escape(token[:10])}…{html.escape(token[-6:])}</code> "
+        f"({len(token)} chars)\n"
+        f"• Mode: <b>single account</b> — pool ready ({n})\n\n"
+        "💡 <i>Kabhi token expire ho jaye to bot khud aapse naya token maangega "
+        "(RK Gamers folder se copy karke dena). Ya /admin se 📧 email+pass daal do "
+        "— phir auto-refresh, zero tension.</i>",
+        parse_mode="HTML")
+
+
+async def settoken_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /settoken <token> — set the single DeepSeek account."""
+    uid = update.effective_user.id
+    if not is_owner(uid) and not is_admin(uid):
+        return
+    text = (update.message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        PENDING_INPUT[uid] = {"kind": "set_token_direct"}
+        await update.message.reply_html(
+            "✍️ <b>Token bhejo — main set + verify kar dunga.</b>\n\n"
+            f"📄 Kahan se copy karna hai:\n<code>{RK_TOKEN_FILE_HINT}</code>\n\n"
+            "File kholo → <code>TOKEN:</code> wali string copy karo → yahan "
+            "paste karke bhej do (with ya without /settoken — dono chalega).\n"
+            "<i>/cancel = abort</i>")
+        return
+    await _apply_new_token(update.message, parts[1])
+
+
+async def token_guide_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner/admin: /token — RK Gamers folder guide + current account status."""
+    uid = update.effective_user.id
+    if not is_owner(uid) and not is_admin(uid):
+        return
+    tokens = await db.list_tokens()
+    kb = adm.my_account_kb(tokens)
+    await update.message.reply_html(adm.token_guide_text(), reply_markup=kb)
+
+
 # ---------- Button handler ----------
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -849,25 +983,30 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "acct:switch":
-        # App-parity: user switches to another pool account (like switching
-        # profiles in the app). DeepSeek sessions are account-scoped, so the
-        # cached session is dropped — the next message opens a fresh chat on
-        # the new account (stream_iter creates it on the leased client).
-        new = await POOL.switch_for(q.from_user.id)
-        if not new:
-            if POOL.size <= 1:
-                await q.answer("Pool me sirf ek account hai — switch ke liye "
-                               "Admin panel se ek aur add karo.", show_alert=True)
-            else:
-                await q.answer("Doosre accounts abhi busy hain — thodi der "
-                               "baad try karo.", show_alert=True)
+        # SINGLE-ACCOUNT MODE: the menu button now shows the one account's
+        # live status (cached health — use /admin → Check Now for a deep check).
+        tokens = await db.list_tokens()
+        if not tokens:
+            await q.answer("🔑 Koi token set nahi hai!\n\n"
+                           "Owner: /settoken <token> bhejo (RK Gamers folder "
+                           "ke RK-TOKEN.txt se).",
+                           show_alert=True)
             return
-        s.session_id = None; s.session_key = new; s.parent_msg_id = None
-        await save_session(q.from_user.id)
-        idx = POOL.label_index(new) or "?"
-        await q.answer(f"✅ Account #{idx} pe switch ho gaya")
-        try: await send_menu(q, s, edit=True, uid=q.from_user.id)
-        except: await q.message.reply_html(status_text(s), reply_markup=main_menu_kb(s, q.from_user.id))
+        t = tokens[0]
+        if t.get("healthy", True):
+            head = "🟢 Account LIVE hai"
+        else:
+            head = "🔴 Token EXPIRED lagta hai"
+        tok = t.get("token", "")
+        prev = (tok[:10] + "…" + tok[-6:]) if len(tok) > 20 else tok
+        email = t.get("email", "") or "—"
+        await q.answer(
+            f"{head}\n\n"
+            f"📧 {email}\n"
+            f"🔑 {prev}\n"
+            f"💸 Uses: {t.get('uses', 0)}\n\n"
+            "Token badalna ho to owner: /settoken <token>",
+            show_alert=True)
         return
 
     if data == "cmd:stats":
@@ -1359,30 +1498,79 @@ async def handle_admin(q, ctx, data: str):
         await _safe_edit_q(q, await adm.stats_text(), adm.admin_menu_kb())
         return
 
-    # ----- NEW: DeepSeek Accounts -----
-    if action in ("accounts", "keys"):
-        await _safe_edit_q(q, await adm.accounts_text(),
-                           adm.accounts_kb(await db.list_tokens()))
+    # ----- RK single-account: My DeepSeek Account -----
+    if action in ("accounts", "keys", "myacc"):
+        tokens = await db.list_tokens()
+        await _safe_edit_q(q, await adm.my_account_text(tokens),
+                           adm.my_account_kb(tokens))
         return
 
     if action == "acc":
         sub = parts[2] if len(parts) > 2 else ""
+        # RK single-account actions
+        if sub == "settoken":
+            PENDING_INPUT[admin_id] = {"kind": "set_token_direct"}
+            await _safe_edit_q(
+                q,
+                "✍️ <b>Ab RK-TOKEN.txt ka token paste karo</b>\n\n"
+                f"📄 File yahan milti hai:\n<code>{html.escape(RK_TOKEN_FILE_HINT)}</code>\n\n"
+                "File kholo → <code>TOKEN:</code> wali poori string copy karo "
+                "→ seedha message me bhej do.\n"
+                "Main live verify karke turant set kar dunga.\n\n"
+                "<i>/cancel to abort.</i>")
+            return
+        if sub == "guide":
+            await _safe_edit_q(q, adm.token_guide_text(), adm.guide_kb())
+            return
+        if sub == "check":
+            await q.answer("Checking account…")
+            tokens = await db.list_tokens()
+            if not tokens:
+                await _safe_edit_q(q, await adm.my_account_text(tokens),
+                                   adm.my_account_kb(tokens))
+                return
+            label = tokens[0]["label"]
+            token = tokens[0]["token"]
+            ok = await asyncio.to_thread(validate_token, token, WORKDIR)
+            info = await asyncio.to_thread(get_user_info, token, WORKDIR) or {} if ok else {}
+            await db.set_token_last_check(label, healthy=bool(ok))
+            if ok:
+                await db.mark_token(label, healthy=True, error="")
+                email = info.get("email", "")
+                uid_ds = info.get("id", "")
+                who = f"📧 <code>{html.escape(str(email))}</code>" if email else \
+                    f"🆔 <code>{html.escape(str(uid_ds))}</code>"
+                txt = (f"✅ <b>Account LIVE hai!</b>\n\n"
+                       f"• {who}\n"
+                       f"• Token: <code>{html.escape(token[:10])}…</code> "
+                       f"({len(token)} chars)\n"
+                       f"• Check time: {time.strftime('%d %b %H:%M')}\n\n"
+                       "Sab sahi hai — normal chat chalu rakho 🚀")
+            else:
+                await db.mark_token(label, healthy=False,
+                                    error="Manual check: token expired")
+                txt = ("❌ <b>Token EXPIRED / invalid hai.</b>\n\n"
+                       + TOKEN_REQUEST_TEXT.format(reason="manual check fail")
+                       + "\n\n🔙 <i>Check karne ke baad wapas aao.</i>")
+            await POOL.reload()
+            tokens = await db.list_tokens()
+            await _safe_edit_q(q, txt + "\n\n" + await adm.my_account_text(tokens),
+                               adm.my_account_kb(tokens))
+            return
         # adm:acc:add_email
         if sub == "add_email":
             PENDING_INPUT[admin_id] = {"kind": "add_email_account"}
             await _safe_edit_q(
                 q,
-                "📧 <b>Add DeepSeek Email Account</b>\n\n"
+                "📧 <b>Auto-Refresh ON karo — Email Account</b>\n\n"
                 "Send in one message:\n"
-                "<code>email password</code>\n"
-                "or <code>label email password</code>\n\n"
-                "Examples:\n"
-                "<code>user@example.com mypass123</code>\n"
-                "<code>myacc2 myemail@gmail.com mypass123</code>\n\n"
-                "Bot email se login karke token auto-fetch karega.\n"
-                "Token expire pe bot <i>auto-refresh</i> karega, aapko manual kuch nahi karna.\n\n"
-                "<b>Note:</b> 1 account = 1 simultaneous user. 10 accounts = 10 users ek sath.\n"
-                "Queue me <i>Analysing your request...</i> dikhega line-by-line.\n\n"
+                "<code>email password</code>\n\n"
+                "Example:\n"
+                "<code>user@example.com mypass123</code>\n\n"
+                "Bot email se login karke token le lega. Token expire pe bot "
+                "<i>khud refresh</i> karega — aapse kabhi naya token nahi maangega.\n\n"
+                "⚠️ <b>Single-account mode:</b> ye aapka current token REPLACE "
+                "kar dega (sirf 1 account chalta hai).\n\n"
                 "<i>/cancel to abort.</i>")
             return
         if sub == "refresh_all":
@@ -1441,28 +1629,23 @@ async def handle_admin(q, ctx, data: str):
             await db.remove_token(label)
             n = await POOL.reload()
             await q.answer(f"Removed · pool = {n}")
-            await _safe_edit_q(q, await adm.accounts_text(),
-                               adm.accounts_kb(await db.list_tokens()))
+            tokens = await db.list_tokens()
+            await _safe_edit_q(q, await adm.my_account_text(tokens),
+                               adm.my_account_kb(tokens))
             return
 
     # ----- keys (legacy) -----
-    if action == "keys":
-        await _safe_edit_q(q, await adm.accounts_text(),
-                           adm.accounts_kb(await db.list_tokens()))
-        return
-
     if action == "key":
         which = parts[2] if len(parts) > 2 else ""
         if which == "add":
-            PENDING_INPUT[admin_id] = {"kind": "addkey"}
+            # legacy alias → RK set-token flow
+            PENDING_INPUT[admin_id] = {"kind": "set_token_direct"}
             await _safe_edit_q(
                 q,
-                "🔑 <b>Add a DeepSeek key (manual token)</b>\n\n"
-                "Send it as:\n<code>label = token</code>\n\n"
-                "Example:\n<code>acct2 = abc123...</code>\n\n"
-                "Tip: Email account better hai — expire pe auto-refresh. Use <b>➕ Add Email Account</b> instead.\n"
-                "<i>Each key/account adds one more simultaneous user. "
-                "/cancel to abort.</i>")
+                "🔑 <b>Token paste karo</b>\n\n"
+                f"📄 File: <code>{html.escape(RK_TOKEN_FILE_HINT)}</code>\n\n"
+                "<code>TOKEN:</code> wali string copy karke bhej do.\n"
+                "<i>/cancel to abort.</i>")
             return
         label = ":".join(parts[2:])
         # If it's actually an account label, show account detail
@@ -1585,22 +1768,21 @@ async def _finish_otp_account(uid, message, pend: dict, token: str):
     email = pend.get("email", "")
     password = pend.get("password", "")
     device_id = pend.get("device_id", "")
-    # label might collide if admin retried — make unique
-    base, n = label, 1
-    while await db.get_token_doc(label):
-        n += 1
-        label = f"{base}-{n}"
-    ok = await db.add_email_account(label, email, password, token, device_id=device_id)
+    # SINGLE-ACCOUNT MODE: replace whatever is stored with this OTP-verified account
+    ok = await db.replace_single_account(token=token, label=label or "rk-gamers",
+                                         email=email, password=password,
+                                         device_id=device_id, auth_type="email")
     PENDING_INPUT.pop(uid, None)
     if not ok:
         await message.reply_html("❌ DB error — account save nahi hua.")
         return
     n = await POOL.reload()
     await message.reply_html(
-        f"✅ <b>Account OTP se verify ho ke add ho gaya!</b> <code>{html.escape(label)}</code>\n"
+        f"✅ <b>Account OTP-verify ho ke SET ho gaya!</b> <code>{html.escape(label or 'rk-gamers')}</code>\n"
         f"📧 {html.escape(email)}\n"
         f"🔑 Token: <code>{html.escape(token[:12])}…</code>\n\n"
-        f"Pool ab <b>{n}</b> account(s). 🟢 Auto-refresh enabled.")
+        f"🟢 Auto-refresh enabled — expire pe bot khud renew karega. "
+        f"(Single-account mode)")
     try:
         await message.reply_html(await adm.accounts_text(),
                                  reply_markup=adm.accounts_kb(await db.list_tokens()))
@@ -1795,18 +1977,20 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
                     parse_mode="HTML")
             except Exception: pass
             return True
-        ok = await db.add_email_account(label, email, password, token,
-                                        device_id=_device_id)
+        ok = await db.replace_single_account(
+            token=token, label=label or "rk-gamers", email=email,
+            password=password, device_id=_device_id, auth_type="email")
         if not ok:
-            await update.message.reply_html(f"❌ DB error — label <b>{html.escape(label)}</b> already exists.")
+            await update.message.reply_html(f"❌ DB error — account save nahi hua.")
             return True
         n = await POOL.reload()
         await update.message.reply_html(
-            f"✅ <b>Account added!</b> <code>{html.escape(label)}</code>\n"
+            f"✅ <b>Account set + auto-refresh ON!</b> <code>{html.escape(label or 'rk-gamers')}</code>\n"
             f"📧 {html.escape(email)}\n"
             f"🔑 Token: <code>{html.escape(token[:12])}…</code> ({len(token)} chars)\n\n"
-            f"Pool ab <b>{n}</b> account(s) → <b>{n}</b> users ek sath chat kar sakte hain.\n"
-            f"{'🟢 Auto-refresh enabled' if email else ''}"
+            f"🟢 Token expire hoga to bot <b>khud login karke refresh</b> karega — "
+            f"aapse kuch nahi maangega.\n"
+            f"(Single-account mode — purana token replace ho gaya)"
         )
         # Send pool status
         try:
@@ -1814,26 +1998,13 @@ async def handle_admin_input(update: Update, ctx, pending: dict) -> bool:
         except: pass
         return True
 
+    if kind == "set_token_direct":
+        await _apply_new_token(update.message, text_raw)
+        return True
+
     if kind == "addkey":
-        if "=" not in text_raw:
-            await update.message.reply_html(
-                "❌ Wrong format. Use <code>label = token</code>")
-            return True
-        label, token = text_raw.split("=", 1)
-        label, token = label.strip(), token.strip()
-        if not label or not token:
-            await update.message.reply_html("❌ Label and token are required.")
-            return True
-        ok = await db.add_token(token, label)
-        if not ok:
-            await update.message.reply_html(
-                f"❌ A key labelled <b>{html.escape(label)}</b> already exists.")
-            return True
-        n = await POOL.reload()
-        await update.message.reply_html(
-            f"✅ Key <b>{html.escape(label)}</b> added.\n\n"
-            f"Pool is now <b>{n}</b> key(s) → <b>{n}</b> user(s) can chat "
-            f"simultaneously.")
+        # legacy pending kind → treat the paste as a raw token (RK flow)
+        await _apply_new_token(update.message, text_raw)
         return True
 
     if kind == "adduser":
@@ -2646,8 +2817,14 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
         except: pass
         await waiter.stop()
         if POOL.size == 0:
-            oops = ("❌ <b>No DeepSeek key/account configured</b>\n\n"
-                    "<i>Admin panel → 🔑 DeepSeek Accounts → ➕ Add Email Account se ek account jodo.</i>")
+            oops = ("❌ <b>Bot ka DeepSeek token set nahi hai ya expire ho gaya</b>\n\n"
+                    "🔑 <b>Fix (2 minute):</b>\n"
+                    "1. Phone me <b>DeepSeek RK</b> app kholo (ek baar chat bhi kholo)\n"
+                    "2. File manager → Internal Storage → <b>RK Gamers</b> folder\n"
+                    f"3. <code>{html.escape(RK_TOKEN_FILE_HINT)}</code> kholo\n"
+                    "4. <b>TOKEN:</b> wali string copy karo\n"
+                    "5. Yahan bhejo: <code>/settoken &lt;token&gt;</code>\n\n"
+                    "📖 <i>/token command = poora guide with buttons.</i>")
         else:
             oops = ("🕒 <b>All slots are busy — queue timed out</b>\n\n"
                     f"This bot has <b>{POOL.size}</b> DeepSeek account(s), so "
@@ -2727,9 +2904,9 @@ async def _process_prompt_chat_inner(*, ctx: ContextTypes.DEFAULT_TYPE,
                                               kb=None)
                               # Note: we don't auto-retry here to avoid loops, user can resend
                           else:
-                              # Notify admin
+                              # Notify admin with the FULL RK-folder fix steps
                               try:
-                                  await notify_owner(ctx.bot, f"⚠️ <b>DeepSeek account failed</b>\nLabel: <code>{html.escape(lease.label)}</code>\nError: <i>{html.escape(err_msg[:250])}</i>\n<i>Admin panel → Accounts → Refresh or check email/pass</i>")
+                                  await notify_owner(ctx.bot, TOKEN_REQUEST_TEXT.format(reason=html.escape(err_msg[:200])))
                               except: pass
                       except Exception as ne:
                           log.warning("report_failure error: %s", ne)
@@ -2910,7 +3087,9 @@ async def health_check_loop(bot):
             async def notify(lbl, email, err):
                 try:
                     await bot.send_message(chat_id=OWNER_ID,
-                        text=f"⚠️ <b>Account auto-check failed</b>\n<code>{html.escape(lbl)}</code> ({html.escape(email)})\n<i>{html.escape(err[:250])}</i>\n\nAdmin panel → 🔑 DeepSeek Accounts → Refresh",
+                        text=(f"⚠️ <b>Account auto-check FAILED</b>\n<code>{html.escape(lbl)}</code>"
+                              f" ({html.escape(email)})\n<i>{html.escape(err[:250])}</i>\n\n"
+                              + TOKEN_REQUEST_TEXT.format(reason="6h auto-check fail")),
                         parse_mode="HTML")
                 except Exception as ne:
                     log.warning("health notify failed: %s", ne)
@@ -2970,7 +3149,7 @@ async def _post_init(app):
         # Only greet on a genuinely new deployment, not on every restart —
         # hosts like Render restart often and the message became spam.
         stamp = os.path.join(WORKDIR, ".last_boot_notice")
-        version = "v7.7.5-stop-fix"
+        version = "rk8.0-single-account"
         seen = ""
         try:
             with open(stamp, encoding="utf-8") as f:
@@ -2980,12 +3159,13 @@ async def _post_init(app):
         if seen != version:
             await app.bot.send_message(
                 chat_id=OWNER_ID,
-                text="🚀 <b>Bot v7 is live — email accounts & queue</b>\n\n"
-                     "👥 Users, approvals, blocking, broadcast\n"
-                     "🔑 DeepSeek accounts via email/pass — auto-refresh!\n"
-                     "⏳ Queue: 1 account=1 user, others wait line-by-line (FIFO)\n"
-                     "🗄 MongoDB · auto health check every 6h\n\n"
-                     "/admin → 🔑 DeepSeek Accounts for management.",
+                text="🚀 <b>Bot RK v8 is live — single-account + RK folder token</b>\n\n"
+                     "🔑 <b>/settoken &lt;token&gt;</b> — RK-TOKEN.txt se token set karo\n"
+                     "📖 <b>/token</b> — poora guide (RK Gamers folder steps)\n"
+                     "1️⃣ <b>Single account</b> — naya token purane ko replace karta hai\n"
+                     "🔄 <b>Auto-refresh:</b> email+pass dala to khud renew; warna bot aapse token maangega\n"
+                     "📁 Token file: <code>RK Gamers/deepseek/com.deepseek.chat.rk/RK-TOKEN.txt</code>\n\n"
+                     "/admin → 🔑 My DeepSeek Account se sab manage hota hai.",
                 parse_mode="HTML",
             )
             try:
@@ -3048,6 +3228,8 @@ def build_app():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("settoken", settoken_cmd))
+    app.add_handler(CommandHandler("token", token_guide_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_media))

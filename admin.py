@@ -37,11 +37,131 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Users", callback_data="adm:users:active:0"),
          InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
         [InlineKeyboardButton("➕ Invite a user", callback_data="adm:inv:menu")],
-        [InlineKeyboardButton("🔑 DeepSeek Accounts", callback_data="adm:accounts"),
+        [InlineKeyboardButton("🔑 My DeepSeek Account", callback_data="adm:accounts"),
          InlineKeyboardButton("📣 Broadcast", callback_data="adm:bc:ask")],
         [InlineKeyboardButton("🚪 Access mode", callback_data="adm:mode")],
         [InlineKeyboardButton("🔙 Back to bot", callback_data="cmd:refresh")],
     ])
+
+
+# --------------------------------------------------------------------------
+# SINGLE-ACCOUNT MODE (RK Gamers build) — one DeepSeek account, no pool
+# --------------------------------------------------------------------------
+
+RK_TOKEN_FOLDER = "RK Gamers/deepseek/com.deepseek.chat.rk"
+RK_TOKEN_FILE = RK_TOKEN_FOLDER + "/RK-TOKEN.txt"
+
+
+def token_guide_text() -> str:
+    return (
+        "📖 <b>Token RK Gamers folder se kaise le</b>\n\n"
+        "1️⃣ Phone me <b>DeepSeek RK</b> app kholo (RK GAMERS wala) aur apne "
+        "DeepSeek account me login karo (email + password).\n\n"
+        "2️⃣ File manager kholo → Internal Storage → <b>RK Gamers</b> folder:\n"
+        f"<code>{html.escape(RK_TOKEN_FILE)}</code>\n\n"
+        "3️⃣ <b>RK-TOKEN.txt</b> kholo — usme likha hoga:\n"
+        "<code>TOKEN: eyJhbGci…</code> (lambi string)\n\n"
+        "4️⃣ Woh string copy karo aur bot ko bhejo:\n"
+        "<code>/settoken &lt;yahan token paste karo&gt;</code>\n\n"
+        "✅ <b>Bas!</b> Bot token verify karke turant live kar dega.\n\n"
+        "ℹ️ <b>Good to know:</b>\n"
+        "• RK-TOKEN.txt app khud fresh rakhta hai — jab bhi bot token maange, "
+        "wahi file se <b>latest</b> token copy karo\n"
+        "• File na mile to RK app me ek baar chat kholo ya app dobara launch karo, "
+        "phir folder refresh karo\n"
+        "• 📧 Email+password My Account me add karoge to expire pe bot "
+        "<b>khud refresh</b> karega — folder wali zaroorat hi nahi padegi\n"
+        "• Browser fallback: <code>chat.deepseek.com</code> login → DevTools → "
+        '<code>localStorage.getItem("userToken")</code>'
+    )
+
+
+def _account_one_liner(t: dict) -> str:
+    dot = "🟢" if t.get("healthy", True) else "🔴"
+    tok = t.get("token", "")
+    tok_prev = (tok[:10] + "…" + tok[-6:]) if len(tok) > 20 else tok
+    email = t.get("email", "")
+    if t.get("auth_type") == "email" and email:
+        return (f"{dot} 📧 <code>{html.escape(email)}</code>\n"
+                f"&nbsp;&nbsp;&nbsp;🔑 <code>{html.escape(tok_prev)}</code> "
+                f"· <b>{t.get('uses', 0)}</b> uses")
+    return f"{dot} 🔑 <code>{html.escape(tok_prev)}</code> · <b>{t.get('uses', 0)}</b> uses"
+
+
+async def my_account_text(tokens: Optional[List[dict]] = None) -> str:
+    if tokens is None:
+        tokens = await db.list_tokens()
+    if not tokens:
+        return (
+            "🔑 <b>My DeepSeek Account</b>\n\n"
+            "🔴 <b>Koi account set nahi hai.</b>\n\n"
+            "Bot tab tak chat <b>nahi</b> kar sakta jab tak ek token set nahi hota.\n\n"
+            "✅ <b>Set karne ke 2 tarike:</b>\n"
+            "• ✍️ <b>Set Token</b> → RK Gamers folder wale <code>RK-TOKEN.txt</code> "
+            "se token copy karke bhejo\n"
+            "• 📧 <b>Email + Password</b> → bot khud login karega aur expire pe "
+            "<b>auto-refresh</b> bhi (best option)\n\n"
+            "📄 Steps nahi dikh ra? <i>📖 Token Guide</i> button dabao."
+        )
+    t = tokens[0]
+    dot = "🟢 Healthy" if t.get("healthy", True) else "🔴 Unhealthy (token expire ho gaya lagta hai)"
+    last_err = (t.get("last_error", "") or "—")[:160]
+    added = time.strftime("%d %b %Y %H:%M", time.localtime(t.get("added_at", 0)))
+    lc = t.get("last_check", 0)
+    lc_s = time.strftime("%d %b %H:%M", time.localtime(lc)) if lc else "—"
+    extra = ""
+    if len(tokens) > 1:
+        extra = (f"\n⚠️ DB me <b>{len(tokens)}</b> purane accounts mile — "
+                 "<i>Set Token / Email dabate hi sab replace ho jayenge "
+                 "(single-account mode)</i>.\n")
+    email = t.get("email", "")
+    auto = "✅ ON — expire pe bot khud login karke token renew karega" \
+        if (t.get("auth_type") == "email" and email) \
+        else "❌ OFF — token expire hote hi bot aapko naya token maangega " \
+             "(RK Gamers folder se copy karke dena)"
+    return (
+        "🔑 <b>My DeepSeek Account</b>\n\n"
+        f"{_account_one_liner(t)}\n"
+        f"• Status: <b>{dot}</b>\n"
+        f"• Auto-refresh: {auto}\n"
+        f"• Added: {added} · Last check: {lc_s}\n"
+        f"• Last error: <i>{html.escape(last_err)}</i>\n"
+        f"{extra}\n"
+        "💡 Token kabhi kaam na kare to <b>✍️ Set Token</b> dabao aur "
+        f"<code>{html.escape(RK_TOKEN_FILE)}</code> se fresh token paste karo."
+    )
+
+
+def my_account_kb(tokens: List[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("✍️ Set Token (RK folder se)",
+                              callback_data="adm:acc:settoken")],
+        [InlineKeyboardButton("📧 Auto-Refresh ON karo (email+pass)",
+                              callback_data="adm:acc:add_email")],
+        [InlineKeyboardButton("🔄 Check Now",
+                              callback_data="adm:acc:check")],
+        [InlineKeyboardButton("📖 Token kahan milega?",
+                              callback_data="adm:acc:guide")],
+    ]
+    if tokens:
+        label = tokens[0].get("label", "rk-gamers")
+        rows.append([InlineKeyboardButton(
+            "🗑 Remove Account", callback_data=f"adm:acc:del:{label}")])
+    rows.append([InlineKeyboardButton("🔙 Admin menu", callback_data="adm:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def guide_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Ab Token Set karo",
+                              callback_data="adm:acc:settoken")],
+        [InlineKeyboardButton("🔙 My Account", callback_data="adm:accounts")],
+    ])
+
+
+# New enhanced accounts keyboard (kept for backward compatibility)
+def accounts_kb(tokens: List[dict]) -> InlineKeyboardMarkup:
+    return my_account_kb(tokens)
 
 
 def invite_menu_kb() -> InlineKeyboardMarkup:
@@ -253,6 +373,11 @@ async def stats_text() -> str:
 
 
 async def accounts_text() -> str:
+    # Single-account mode alias — new UI lives in my_account_text()
+    return await my_account_text()
+
+
+async def _old_accounts_text() -> str:
     tokens = await db.list_tokens()
     if not tokens:
         return (

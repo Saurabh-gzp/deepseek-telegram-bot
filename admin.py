@@ -48,7 +48,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
 # SINGLE-ACCOUNT MODE (RK Gamers build) — one DeepSeek account, no pool
 # --------------------------------------------------------------------------
 
-RK_TOKEN_FOLDER = "RK Gamers/deepseek/com.deepseek.chat.rk"
+RK_TOKEN_FOLDER = "RK Gamers/deepseek/com.deepseek.chat.rk/files"
 RK_TOKEN_FILE = RK_TOKEN_FOLDER + "/RK-TOKEN.txt"
 
 

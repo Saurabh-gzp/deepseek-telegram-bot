@@ -127,7 +127,7 @@ PENDING_NOTIFIED: Dict[int, bool] = {}
 # When the API stops working the bot tries, in order:
 #   1. auto-refresh via stored email+password (if the owner added them),
 #   2. asking the OWNER for a fresh token from RK-TOKEN.txt.
-RK_TOKEN_FILE_HINT = "RK Gamers/deepseek/com.deepseek.chat.rk/RK-TOKEN.txt"
+RK_TOKEN_FILE_HINT = "RK Gamers/deepseek/com.deepseek.chat.rk/files/RK-TOKEN.txt"
 TOKEN_REQUEST_TEXT = (
     "⚠️ <b>DeepSeek token kaam nahi kar raha!</b>\n\n"
     "🔹 Reason: <i>{reason}</i>\n\n"
@@ -3164,7 +3164,7 @@ async def _post_init(app):
                      "📖 <b>/token</b> — poora guide (RK Gamers folder steps)\n"
                      "1️⃣ <b>Single account</b> — naya token purane ko replace karta hai\n"
                      "🔄 <b>Auto-refresh:</b> email+pass dala to khud renew; warna bot aapse token maangega\n"
-                     "📁 Token file: <code>RK Gamers/deepseek/com.deepseek.chat.rk/RK-TOKEN.txt</code>\n\n"
+                     "📁 Token file: <code>RK Gamers/deepseek/com.deepseek.chat.rk/files/RK-TOKEN.txt</code>\n\n"
                      "/admin → 🔑 My DeepSeek Account se sab manage hota hai.",
                 parse_mode="HTML",
             )

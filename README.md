@@ -85,7 +85,7 @@ This build runs in **single-account mode** — one DeepSeek account, managed ent
 
 1. Open the **DeepSeek RK** app on your phone (RK GAMERS build) and log in once
 2. In any file manager open **Internal Storage → RK Gamers** folder:
-   `RK Gamers/deepseek/com.deepseek.chat.rk/RK-TOKEN.txt`
+   `RK Gamers/deepseek/com.deepseek.chat.rk/files/RK-TOKEN.txt`
 3. Copy the long string after `TOKEN:` — the app keeps this file always fresh
 4. In the bot send: `/settoken <paste the token>` — it validates live and goes live instantly
 5. Full guide anytime: `/token` command or /admin → 🔑 My DeepSeek Account
